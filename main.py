@@ -56,23 +56,42 @@ class ShopConfig(BaseModel):
 
 
 def load_shops() -> Dict[str, ShopConfig]:
-    """Parse SHOPS_JSON env var into token->ShopConfig map."""
+    """
+    Parse SHOPS_JSON into a token -> ShopConfig map.
+
+    Example SHOPS_JSON:
+
+    [
+      {
+        "id": "sj_auto_body",
+        "name": "SJ Auto Body",
+        "webhook_token": "shop_sj_84k2p1"
+      }
+    ]
+    """
     raw = os.getenv("SHOPS_JSON")
     if not raw:
-        # Default single shop if nothing configured
-        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo_token")
+        default = ShopConfig(
+            id="default",
+            name="Auto Body Shop",
+            webhook_token="demo_token",
+        )
         return {default.webhook_token: default}
 
     try:
         data = json.loads(raw)
-        shops = {}
-        for s in data:
-            shop = ShopConfig(**s)
+        shops: Dict[str, ShopConfig] = {}
+        for item in data:
+            shop = ShopConfig(**item)
             shops[shop.webhook_token] = shop
         return shops
     except Exception as e:
         print("Failed to parse SHOPS_JSON:", e)
-        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo_token")
+        default = ShopConfig(
+            id="default",
+            name="Auto Body Shop",
+            webhook_token="demo_token",
+        )
         return {default.webhook_token: default}
 
 
@@ -81,9 +100,18 @@ SESSIONS: Dict[str, dict] = {}
 
 
 def get_shop(request: Request) -> ShopConfig:
-    """Pick shop based on ?token= in the Twilio webhook URL."""
+    """
+    Pick shop based on ?token= in the Twilio webhook URL.
+
+    Example Twilio URL:
+    https://your-service.up.railway.app/sms-webhook?token=shop_sj_84k2p1
+    """
     if not SHOPS_BY_TOKEN:
-        return ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo_token")
+        return ShopConfig(
+            id="default",
+            name="Auto Body Shop",
+            webhook_token="demo_token",
+        )
 
     token = request.query_params.get("token")
     if not token or token not in SHOPS_BY_TOKEN:
@@ -114,7 +142,7 @@ class Estimate(Base):
 
 
 @app.on_event("startup")
-def on_startup():
+def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
 
 
@@ -122,11 +150,12 @@ def on_startup():
 # HELPERS: IMAGES + VIN
 # ============================================================
 
-VIN_PATTERN = re.compile(r"\\b([A-HJ-NPR-Z0-9]{17})\\b")
+VIN_PATTERN = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
 
 def extract_image_urls(form) -> List[str]:
-    urls = []
+    """Collect all MediaUrlN fields from the Twilio form."""
+    urls: List[str] = []
     i = 0
     while True:
         key = f"MediaUrl{i}"
@@ -152,7 +181,17 @@ def extract_vin(text: str) -> Optional[str]:
 # ============================================================
 
 
-async def estimate_damage_from_images(image_urls: List[str], vin: Optional[str], shop: ShopConfig) -> dict:
+async def estimate_damage_from_images(
+    image_urls: List[str],
+    vin: Optional[str],
+    shop: ShopConfig,
+) -> dict:
+    """
+    Call OpenAI vision model to estimate damage and Ontario 2025 cost range.
+    Returns a dict with keys:
+    severity, damage_areas, damage_types, recommended_repairs,
+    min_cost, max_cost, confidence, vin_used
+    """
     if not OPENAI_API_KEY:
         # Fallback simple estimate if key missing
         return {
@@ -348,7 +387,12 @@ Return strictly this JSON (no extra text):
 # ============================================================
 
 
-def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], result: dict) -> str:
+def save_estimate_to_db(
+    shop: ShopConfig,
+    phone: str,
+    vin: Optional[str],
+    result: dict,
+) -> str:
     db = SessionLocal()
     try:
         est = Estimate(
@@ -371,7 +415,7 @@ def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], result
         db.close()
 
 
-def require_admin(request: Request):
+def require_admin(request: Request) -> None:
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
     incoming = request.headers.get("x-api-key") or request.query_params.get("api_key")
@@ -381,171 +425,3 @@ def require_admin(request: Request):
 
 # ============================================================
 # APPOINTMENT SLOTS
-# ============================================================
-
-
-def get_appointment_slots(n: int = 3):
-    now = datetime.datetime.now()
-    tomorrow = now + datetime.timedelta(days=1)
-    hours = [9, 11, 14, 16]
-
-    slots = []
-    for h in hours:
-        dt = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
-        if dt > now:
-            slots.append(dt)
-    return slots[:n]
-
-
-# ============================================================
-# ROUTES
-# ============================================================
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Auto-shop backend running"}
-
-
-@app.post("/sms-webhook")
-async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
-    """Main Twilio SMS entrypoint."""
-    form = await request.form()
-    from_number = form.get("From")
-    body = (form.get("Body") or "").strip()
-
-    image_urls = extract_image_urls(form)
-    vin = extract_vin(body)
-
-    reply = MessagingResponse()
-
-    session_key = f"{shop.id}:{from_number}"
-    session = SESSIONS.get(session_key)
-
-    # 1) Booking selection flow
-    if session and session.get("awaiting_time") and body in {"1", "2", "3"}:
-        idx = int(body) - 1
-        slots = session["slots"]
-
-        if 0 <= idx < len(slots):
-            chosen = slots[idx]
-            reply.message(
-                f"You're booked at {shop.name} for "
-                f"{chosen.strftime('%a %b %d at %I:%M %p')}."
-            )
-
-            session["awaiting_time"] = False
-            SESSIONS[session_key] = session
-
-            return Response(content=str(reply), media_type="application/xml")
-
-    # 2) Multi-image AI estimate
-    if image_urls:
-        result = await estimate_damage_from_images(image_urls, vin, shop)
-        estimate_id = save_estimate_to_db(shop, from_number, vin, result)
-
-        severity = result["severity"]
-        min_cost = result["min_cost"]
-        max_cost = result["max_cost"]
-        cost_range = f"${min_cost:,.0f} - ${max_cost:,.0f}"
-
-        areas = ", ".join(result["damage_areas"]) or "specific panels detected"
-        types = ", ".join(result["damage_types"]) or "detailed damage types detected"
-
-        slots = get_appointment_slots()
-        SESSIONS[session_key] = {"awaiting_time": True, "slots": slots}
-
-        lines = [
-            f"AI Damage Estimate for {shop.name}",
-            f"Severity: {severity}",
-            f"Estimated Cost (Ontario 2025): {cost_range}",
-            f"Panels: {areas}",
-            f"Damage Types: {types}",
-            f"Estimate ID (internal): {estimate_id}",
-        ]
-
-        if vin and result.get("vin_used"):
-            lines.append(f"VIN used for calibration: {vin}")
-
-        lines.append("")
-        lines.append("Reply with a number to book an in-person estimate:")
-
-        for i, s in enumerate(slots, 1):
-            lines.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
-
-        reply.message("\\n".join(lines))
-        return Response(content=str(reply), media_type="application/xml")
-
-    # 3) Default onboarding message (no images)
-    intro = [
-        f"Thanks for messaging {shop.name}.",
-        "",
-        "To get an AI-powered pre-estimate:",
-        "- Send 1–5 clear photos of the damage",
-        "- Optional: include your 17-character VIN in the text",
-    ]
-
-    reply.message("\\n".join(intro))
-    return Response(content=str(reply), media_type="application/xml")
-
-
-# ============================================================
-# SIMPLE ADMIN API (READ-ONLY)
-# ============================================================
-
-
-@app.get("/admin/estimates")
-def list_estimates(
-    request: Request,
-    shop_id: Optional[str] = None,
-    limit: int = 50,
-    skip: int = 0,
-):
-    require_admin(request)
-    db = SessionLocal()
-    try:
-        q = db.query(Estimate)
-        if shop_id:
-            q = q.filter(Estimate.shop_id == shop_id)
-        q = q.order_by(Estimate.created_at.desc()).offset(skip).limit(limit)
-        rows = q.all()
-        return [
-            {
-                "id": e.id,
-                "shop_id": e.shop_id,
-                "customer_phone": e.customer_phone,
-                "severity": e.severity,
-                "min_cost": e.min_cost,
-                "max_cost": e.max_cost,
-                "created_at": e.created_at.isoformat(),
-            }
-            for e in rows
-        ]
-    finally:
-        db.close()
-
-
-@app.get("/admin/estimates/{estimate_id}")
-def get_estimate(estimate_id: str, request: Request):
-    require_admin(request)
-    db = SessionLocal()
-    try:
-        e = db.query(Estimate).filter(Estimate.id == estimate_id).first()
-        if not e:
-            raise HTTPException(status_code=404, detail="Estimate not found")
-        return {
-            "id": e.id,
-            "shop_id": e.shop_id,
-            "customer_phone": e.customer_phone,
-            "severity": e.severity,
-            "damage_areas": e.damage_areas,
-            "damage_types": e.damage_types,
-            "recommended_repairs": e.recommended_repairs,
-            "min_cost": e.min_cost,
-            "max_cost": e.max_cost,
-            "confidence": e.confidence,
-            "vin": e.vin,
-            "created_at": e.created_at.isoformat(),
-        }
-    finally:
-        db.close()
