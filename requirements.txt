@@ -1,8 +1,9 @@
 fastapi
-uvicorn
-requests
-twilio
-openai>=1.51.0
-python-dotenv
-python-multipart==0.0.9
+uvicorn[standard]
 sqlalchemy
+pydantic
+python-multipart
+httpx
+twilio
+psycopg2-binary
+python-dotenv
