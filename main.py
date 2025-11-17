@@ -304,3 +304,39 @@ Reply with a number to book an in-person estimate:
         "• Optional: include your 17-digit VIN"
     )
     return Response(content=str(reply), media_type="application/xml")
+@app.get("/diagnostic")
+async def diagnostic():
+    import os
+    import httpx
+    results = {}
+
+    # Test OpenAI key exists
+    key = os.getenv("OPENAI_API_KEY")
+    results["OPENAI_API_KEY_present"] = bool(key)
+
+    # Test OpenAI API connectivity
+    if key:
+        try:
+            headers = {"Authorization": f"Bearer {key}"}
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get("https://api.openai.com/v1/models", headers=headers)
+            results["openai_api_status"] = r.status_code
+        except Exception as e:
+            results["openai_api_status"] = str(e)
+    else:
+        results["openai_api_status"] = "No OPENAI_API_KEY"
+
+    # Test SHOPS_JSON
+    try:
+        import json
+        sj = os.getenv("SHOPS_JSON")
+        json.loads(sj) if sj else None
+        results["SHOPS_JSON_valid"] = True
+    except:
+        results["SHOPS_JSON_valid"] = False
+
+    # Test database URL
+    db = os.getenv("DATABASE_URL")
+    results["DATABASE_URL_present"] = bool(db)
+
+    return results
