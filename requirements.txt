@@ -5,3 +5,4 @@ twilio
 openai>=1.51.0
 python-dotenv
 python-multipart==0.0.9
+sqlalchemy
