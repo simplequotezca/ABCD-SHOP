@@ -14,24 +14,23 @@ SHOP_NAME = os.getenv("SHOP_NAME", "SJ Auto Body")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
-# -------------- Helper: Download image & convert to Base64 ----------------
+# ----------------- Download + Base64 Encoding -----------------
 def download_and_encode(image_url: str) -> str:
     img_bytes = requests.get(image_url).content
     return base64.b64encode(img_bytes).decode("utf-8")
 
-# -------------- AI Damage Analysis (REAL GPT-4O Vision) -------------------
+# ----------------- AI Damage Analyzer -------------------------
 def analyze_damage(image_b64: str):
     prompt = """
-You are an auto body damage estimator AI.
+You are an auto body estimator AI. Analyze vehicle damage in detail.
 
-Analyze the vehicle damage in the image and return the following fields IN CLEAR, SIMPLE TEXT:
+Return:
+- Severity (Minor/Moderate/Severe/Total Loss)
+- Damaged Panels
+- Damage Types
+- Estimated Cost (CAD)
 
-- Severity (Minor, Moderate, Severe, Total Loss)
-- Detected Panels (list actual car panels)
-- Damage Types (scratches, dents, cracks, bumper misalignment, crease, deep gouge, etc.)
-- Estimated Repair Cost (Ontario 2025 prices)
-
-Be very specific. Do NOT output dashes. Always give real findings even if approximate.
+Be specific. No '-' responses. Always give results.
 """
 
     response = client.responses.create(
@@ -46,50 +45,49 @@ Be very specific. Do NOT output dashes. Always give real findings even if approx
                 ]
             }
         ],
-        max_output_tokens=450,
+        max_output_tokens=400
     )
 
     return response.output_text
 
-# -------------- SMS Webhook -------------------
+# ----------------- Twilio Webhook ------------------------------
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
     form = await request.form()
     body = form.get("Body", "")
     image_url = form.get("MediaUrl0")
-    from_number = form.get("From")
 
     reply = MessagingResponse()
 
     if image_url:
         try:
-            encoded_img = download_and_encode(image_url)
-
-            analysis = analyze_damage(encoded_img)
-
+            encoded = download_and_encode(image_url)
+            analysis = analyze_damage(encoded)
             estimate_id = str(uuid.uuid4())[:12]
 
-            final_msg = f"""
-AI Damage Estimate for {SHOP_NAME}
-
-{analysis}
-
-Estimate ID:
-{estimate_id}
-
-Reply with a number to book an appointment:
-1) Tue Nov 18 at 09:00 AM
-2) Tue Nov 18 at 11:00 AM
-3) Tue Nov 18 at 02:00 PM
-"""
-
-            reply.message(final_msg)
-
+            reply.message(
+                f"AI Damage Estimate for {SHOP_NAME}\n\n"
+                f"{analysis}\n\n"
+                f"Estimate ID: {estimate_id}\n\n"
+                "Reply with 1, 2, or 3 to book:\n"
+                "1) Tue 9:00 AM\n"
+                "2) Tue 11:00 AM\n"
+                "3) Tue 2:00 PM"
+            )
         except Exception as e:
-            reply.message(f"Error analyzing image: {e}")
+            reply.message(f"Error: {e}")
 
         return Response(content=str(reply), media_type="application/xml")
 
-    # If no image sent
-    reply.message("Please send a clear photo of the vehicle damage.")
+    reply.message("Please send a photo of the vehicle damage.")
     return Response(content=str(reply), media_type="application/xml")
+
+# ----------------- RUN SERVER for Railway ----------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=False
+    )
