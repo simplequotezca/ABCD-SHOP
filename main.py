@@ -2,11 +2,11 @@ from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
+
 import datetime
 import os
 import json
 import httpx
-import asyncio
 from typing import Dict, Optional, List
 import re
 import uuid
@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, Column, String, Float, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ============================================================
-# ENV + DATABASE
+# ENVIRONMENT
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -24,18 +24,15 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 SHOPS_JSON = os.getenv("SHOPS_JSON")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Attach Postgres in Railway first.")
+    raise RuntimeError("DATABASE_URL missing in Railway!")
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
-
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
 app = FastAPI()
 
+VIN_PATTERN = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
 # ============================================================
 # SHOP CONFIG
@@ -47,21 +44,16 @@ class ShopConfig(BaseModel):
     webhook_token: str
 
 
-def load_shops() -> Dict[str, ShopConfig]:
+def load_shops():
     if not SHOPS_JSON:
-        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo_token")
-        return {default.webhook_token: default}
+        return {"shop_sj_84k2p1": ShopConfig(id="sj_auto_body", name="SJ Auto Body", webhook_token="shop_sj_84k2p1")}
 
-    try:
-        data = json.loads(SHOPS_JSON)
-        shops = {}
-        for s in data:
-            shop = ShopConfig(**s)
-            shops[shop.webhook_token] = shop
-        return shops
-    except Exception:
-        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo_token")
-        return {default.webhook_token: default}
+    data = json.loads(SHOPS_JSON)
+    shops = {}
+    for s in data:
+        shop = ShopConfig(**s)
+        shops[shop.webhook_token] = shop
+    return shops
 
 
 SHOPS_BY_TOKEN = load_shops()
@@ -71,20 +63,20 @@ SESSIONS: Dict[str, dict] = {}
 def get_shop(request: Request) -> ShopConfig:
     token = request.query_params.get("token")
     if not token or token not in SHOPS_BY_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid or missing shop token")
+        raise HTTPException(status_code=403, detail="Invalid shop token")
     return SHOPS_BY_TOKEN[token]
 
 
 # ============================================================
-# DATABASE MODELS
+# DATABASE MODEL
 # ============================================================
 
 class Estimate(Base):
     __tablename__ = "estimates"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    shop_id = Column(String, index=True)
-    customer_phone = Column(String, index=True)
+    shop_id = Column(String)
+    customer_phone = Column(String)
     severity = Column(String)
     damage_areas = Column(Text)
     damage_types = Column(Text)
@@ -97,111 +89,100 @@ class Estimate(Base):
 
 
 @app.on_event("startup")
-def on_startup():
+def startup():
     Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
-# HELPERS — VIN + IMAGES
+# HELPERS
 # ============================================================
-
-VIN_PATTERN = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
-
-
-def extract_image_urls(form) -> List[str]:
-    urls = []
-    i = 0
-    while True:
-        key = f"MediaUrl{i}"
-        url = form.get(key)
-        if not url:
-            break
-        urls.append(url)
-        i += 1
-    return urls[:2]  # LIMIT TO TWO IMAGES
-
 
 def extract_vin(text: str) -> Optional[str]:
     if not text:
         return None
-    match = VIN_PATTERN.search(text.upper())
-    return match.group(1) if match else None
+    m = VIN_PATTERN.search(text.upper())
+    return m.group(1) if m else None
+
+
+def extract_image_urls(form) -> List[str]:
+    urls = []
+    for i in range(5):
+        u = form.get(f"MediaUrl{i}")
+        if u:
+            urls.append(u)
+    return urls[:2]     # limit to 2 images for 4o-mini stability
 
 
 # ============================================================
-# GPT-4o-mini DAMAGE ESTIMATION + RETRIES
+# AI DAMAGE ESTIMATOR
 # ============================================================
 
-async def estimate_damage_from_images(image_urls: List[str], vin: Optional[str], shop: ShopConfig) -> dict:
-
-    if not OPENAI_API_KEY:
-        return fallback_result(vin_used=False)
+async def analyze_damage(image_urls, vin):
+    """
+    Calls GPT-4o-mini vision with stable retries.
+    """
 
     system_prompt = """
-You are an Ontario (Canada, 2025) certified auto-body estimator.
-Output ONLY JSON.
-""".strip()
+You are a certified Ontario auto body damage estimator.
+Provide precise and specific analysis. Output ONLY JSON:
 
-    content = [
-        {"type": "text", "text": "Analyze the vehicle damage images."}
-    ]
+{
+ "severity": "",
+ "damage_areas": [],
+ "damage_types": [],
+ "recommended_repairs": [],
+ "min_cost": number,
+ "max_cost": number,
+ "confidence": number
+}
+"""
 
+    user_content = [{"type": "text", "text": "Analyze the vehicle damage."}]
     if vin:
-        content[0]["text"] += f" VIN: {vin}"
+        user_content.append({"type": "text", "text": f"VIN: {vin}"})
 
     for url in image_urls:
-        content.append({"type": "image_url", "image_url": {"url": url}})
+        user_content.append({"type": "image_url", "image_url": {"url": url}})
 
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
+            {"role": "user", "content": user_content}
         ],
-        "response_format": {"type": "json_object"},
+        "response_format": {"type": "json_object"}
     }
 
-    async def call_openai():
-        async with httpx.AsyncClient(timeout=45) as client:
-            res = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            res.raise_for_status()
-            return res.json()
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-    # Retry up to 3 times
     for attempt in range(3):
         try:
-            data = await call_openai()
-            raw = data["choices"][0]["message"]["content"]
-            result = json.loads(raw)
+            async with httpx.AsyncClient(timeout=40) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    json=payload,
+                    headers=headers
+                )
+            r.raise_for_status()
 
-            # sanity defaults
-            result.setdefault("severity", "Moderate")
-            result.setdefault("damage_areas", [])
-            result.setdefault("damage_types", [])
-            result.setdefault("recommended_repairs", [])
-            result.setdefault("min_cost", 600)
-            result.setdefault("max_cost", 1500)
-            result.setdefault("confidence", 0.75)
-            result.setdefault("vin_used", bool(vin))
+            raw = r.json()["choices"][0]["message"]["content"]
+            data = json.loads(raw)
 
-            return result
+            # sanitize
+            data.setdefault("severity", "Moderate")
+            data.setdefault("damage_areas", [])
+            data.setdefault("damage_types", [])
+            data.setdefault("recommended_repairs", [])
+            data.setdefault("min_cost", 600)
+            data.setdefault("max_cost", 1500)
+            data.setdefault("confidence", 0.7)
+
+            return data
 
         except Exception as e:
-            print(f"[AI ERROR] Attempt {attempt+1}: {e}")
-            if attempt < 2:
-                await asyncio.sleep(1.5)
-            else:
-                return fallback_result(vin_used=bool(vin))
+            print("AI error attempt", attempt + 1, e)
 
-
-def fallback_result(vin_used=False):
+    # If all fails → fallback
     return {
         "severity": "Moderate",
         "damage_areas": [],
@@ -209,53 +190,47 @@ def fallback_result(vin_used=False):
         "recommended_repairs": [],
         "min_cost": 600,
         "max_cost": 1500,
-        "confidence": 0.5,
-        "vin_used": vin_used,
+        "confidence": 0.5
     }
-
-
-# ============================================================
-# APPOINTMENT SLOTS
-# ============================================================
-
-def get_appointment_slots(n=3):
-    now = datetime.datetime.now()
-    tomorrow = now + datetime.timedelta(days=1)
-    hrs = [9, 11, 14]
-
-    slots = []
-    for h in hrs:
-        dt = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
-        if dt > now:
-            slots.append(dt)
-    return slots[:n]
 
 
 # ============================================================
 # SAVE ESTIMATE
 # ============================================================
 
-def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], r: dict) -> str:
+def save_estimate(shop, phone, vin, result):
     db = SessionLocal()
-    try:
-        est = Estimate(
-            shop_id=shop.id,
-            customer_phone=phone,
-            severity=r["severity"],
-            damage_areas=", ".join(r["damage_areas"]),
-            damage_types=", ".join(r["damage_types"]),
-            recommended_repairs=", ".join(r["recommended_repairs"]),
-            min_cost=r["min_cost"],
-            max_cost=r["max_cost"],
-            confidence=r["confidence"],
-            vin=vin,
-        )
-        db.add(est)
-        db.commit()
-        db.refresh(est)
-        return est.id
-    finally:
-        db.close()
+    e = Estimate(
+        shop_id=shop.id,
+        customer_phone=phone,
+        severity=result["severity"],
+        damage_areas=", ".join(result["damage_areas"]),
+        damage_types=", ".join(result["damage_types"]),
+        recommended_repairs=", ".join(result["recommended_repairs"]),
+        min_cost=result["min_cost"],
+        max_cost=result["max_cost"],
+        confidence=result["confidence"],
+        vin=vin
+    )
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    db.close()
+    return e.id
+
+
+# ============================================================
+# APPOINTMENT SLOTS
+# ============================================================
+
+def get_slots():
+    tomorrow = datetime.datetime.now() + datetime.timedelta(days=1)
+    times = [9, 11, 14]
+    slots = []
+    for t in times:
+        dt = tomorrow.replace(hour=t, minute=0, second=0)
+        slots.append(dt)
+    return slots
 
 
 # ============================================================
@@ -263,78 +238,69 @@ def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], r: dic
 # ============================================================
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
+def home():
+    return {"message": "Backend running"}
 
 
 @app.post("/sms-webhook")
-async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
-
+async def webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
     form = await request.form()
-    body = (form.get("Body") or "").strip()
-    from_number = form.get("From")
-
-    image_urls = extract_image_urls(form)
-    vin = extract_vin(body)
+    msg = (form.get("Body") or "").strip()
+    phone = form.get("From")
+    images = extract_image_urls(form)
+    vin = extract_vin(msg)
 
     reply = MessagingResponse()
 
-    # SESSION KEY
-    session_key = f"{shop.id}:{from_number}"
+    # If user is choosing a time
+    session_key = f"{shop.id}:{phone}"
     session = SESSIONS.get(session_key)
 
-    # Booking confirmation
-    if session and session.get("awaiting") and body in {"1", "2", "3"}:
-        idx = int(body) - 1
-        slots = session["slots"]
-
-        if 0 <= idx < len(slots):
-            chosen = slots[idx]
+    if session and session.get("waiting_for_time"):
+        if msg in {"1", "2", "3"}:
+            chosen = session["slots"][int(msg)-1]
             reply.message(
-                f"You're booked at {shop.name} on "
-                f"{chosen.strftime('%a %b %d at %I:%M %p')}."
+                f"You're booked at {shop.name} on {chosen.strftime('%a %b %d at %I:%M %p')}."
             )
-            session["awaiting"] = False
-            return Response(str(reply), media_type="application/xml")
+            session["waiting_for_time"] = False
+            return Response(content=str(reply), media_type="application/xml")
 
-    # Images detected → run AI
-    if image_urls:
-        result = await estimate_damage_from_images(image_urls, vin, shop)
-        est_id = save_estimate_to_db(shop, from_number, vin, result)
+    # If user sent images → run AI
+    if images:
+        result = await analyze_damage(images, vin)
+        estimate_id = save_estimate(shop, phone, vin, result)
 
-        slots = get_appointment_slots()
-        SESSIONS[session_key] = {"awaiting": True, "slots": slots}
+        slots = get_slots()
+        SESSIONS[session_key] = {"waiting_for_time": True, "slots": slots}
 
-        lines = [
-            f"AI Damage Estimate for {shop.name}",
-            "",
-            f"Severity: {result['severity']}",
-            f"Estimated Cost (Ontario 2025): ${result['min_cost']:,} – ${result['max_cost']:,}",
-            "",
-            "Detected Panels:",
-            ", ".join(result["damage_areas"]) or "-",
-            "",
-            "Damage Types:",
-            ", ".join(result["damage_types"]) or "-",
-            "",
-            f"Estimate ID:\n{est_id}",
-            "",
-            "Reply with a number to book an in-person estimate:",
-        ]
+        text = f"""AI Damage Estimate for {shop.name}
 
-        for i, s in enumerate(slots, 1):
-            lines.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
+Severity: {result['severity']}
+Estimated Cost (Ontario 2025): ${result['min_cost']:,} – ${result['max_cost']:,}
 
-        reply.message("\n".join(lines))
-        return Response(str(reply), media_type="application/xml")
+Detected Panels:
+- {", ".join(result['damage_areas']) if result['damage_areas'] else "-"}
 
-    # No images → intro
-    intro = [
-        f"Thanks for messaging {shop.name}.",
-        "",
-        "To get an AI-powered estimate:",
-        "- Send 1–2 clear photos of the damage",
-        "- Optional: include your VIN",
-    ]
-    reply.message("\n".join(intro))
-    return Response(str(reply), media_type="application/xml")
+Damage Types:
+- {", ".join(result['damage_types']) if result['damage_types'] else "-"}
+
+Estimate ID:
+{estimate_id}
+
+Reply with a number to book an in-person estimate:
+1) {slots[0].strftime('%a %b %d at %I:%M %p')}
+2) {slots[1].strftime('%a %b %d at %I:%M %p')}
+3) {slots[2].strftime('%a %b %d at %I:%M %p')}
+"""
+
+        reply.message(text)
+        return Response(content=str(reply), media_type="application/xml")
+
+    # Otherwise → onboarding
+    reply.message(
+        f"Thanks for messaging {shop.name}!\n\n"
+        "To get an AI-powered repair estimate:\n"
+        "• Send 1–2 photos of the damage\n"
+        "• Optional: include your 17-digit VIN"
+    )
+    return Response(content=str(reply), media_type="application/xml")
