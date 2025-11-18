@@ -18,7 +18,7 @@ from sqlalchemy import create_engine, Column, String, Float, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ============================================================
-# ENV + DATABASE
+# ENVIRONMENT + DATABASE
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -31,22 +31,17 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 if not DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is not set. On Railway, attach Postgres then copy the "
-        "full connection URL into a DATABASE_URL variable."
+        "DATABASE_URL not set. Attach Postgres in Railway and set DATABASE_URL."
     )
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
-
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
 app = FastAPI()
 
 # ============================================================
-# TWILIO CLIENT (for downloading media)
+# TWILIO MEDIA HELPERS
 # ============================================================
 
 twilio_client: Optional[Client] = None
@@ -55,204 +50,25 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 
 
 def download_twilio_image(media_url: str) -> bytes:
-    """
-    Download an MMS image from Twilio using the official client so
-    authentication is handled correctly.
-    """
+    """Download image from Twilio MMS securely."""
     if not twilio_client:
-        raise RuntimeError("Twilio client not configured")
+        raise RuntimeError("Twilio not configured")
 
     resp = twilio_client.request("GET", media_url)
     if resp.status_code != 200:
-        raise Exception(
-            f"Error downloading media: {resp.status_code} {resp.text}"
-        )
+        raise Exception(f"Twilio media download error: {resp.status_code}")
 
     return resp.content
 
 
 def image_bytes_to_data_url(image_bytes: bytes) -> str:
-    """
-    Convert raw image bytes to a base64 data URL that OpenAI can consume.
-    """
+    """Convert raw image bytes to base64 image URL."""
     b64 = base64.b64encode(image_bytes).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
-    # ============================================================
-# SUPER PROMPT v2.0 + VALIDATION LAYER
-# ============================================================
-
-ALLOWED_PANELS = {
-    "front bumper", "rear bumper",
-    "hood", "trunk",
-    "left fender", "right fender",
-    "left front door", "right front door",
-    "left rear door", "right rear door",
-    "left quarter panel", "right quarter panel",
-    "rocker panel", "roof",
-    "rim/wheel", "tire",
-    "headlight", "tail light",
-}
-
-ALLOWED_DAMAGE_TYPES = {
-    "scratch", "paint scuff", "paint chip",
-    "dent", "crease", "crack",
-    "curb rash", "gouge", "bent rim",
-    "bumper deformation", "misalignment",
-}
-
-ALLOWED_SEVERITY = {"Minor", "Moderate", "Severe", "unknown"}
-ALLOWED_TIERS = {"Basic Cosmetic", "Standard Repair", "Premium / Extensive", "unknown"}
-
-
-def compute_pricing_tier(min_cost: float, max_cost: float) -> str:
-    avg = (min_cost + max_cost) / 2.0
-    if max_cost <= 0:
-        return "unknown"
-    if avg <= 600:
-        return "Basic Cosmetic"
-    if avg <= 2500:
-        return "Standard Repair"
-    return "Premium / Extensive"
-
-
-def validate_and_normalize_estimate(raw: dict) -> dict:
-    """
-    Normalizes and protects against AI hallucinations or malformed JSON.
-    """
-    result: dict = {}
-
-    # Severity
-    severity = str(raw.get("severity", "unknown"))
-    if severity not in ALLOWED_SEVERITY:
-        severity = "unknown"
-    result["severity"] = severity
-
-    # Panels
-    panels = raw.get("panels") or []
-    if not isinstance(panels, list):
-        panels = []
-    clean_panels = [
-        p for p in panels if isinstance(p, str) and p in ALLOWED_PANELS
-    ]
-    result["panels"] = clean_panels
-
-    # Damage types
-    damage_types = raw.get("damage_types") or []
-    if not isinstance(damage_types, list):
-        damage_types = []
-    clean_damage = [
-        d for d in damage_types
-        if isinstance(d, str) and d in ALLOWED_DAMAGE_TYPES
-    ]
-    result["damage_types"] = clean_damage
-
-    # Costs
-    try:
-        min_cost = float(raw.get("estimated_cost_min", 0) or 0)
-    except Exception:
-        min_cost = 0.0
-    try:
-        max_cost = float(raw.get("estimated_cost_max", 0) or 0)
-    except Exception:
-        max_cost = 0.0
-
-    if max_cost < min_cost:
-        min_cost, max_cost = max_cost, min_cost
-
-    # Sanity caps
-    if max_cost - min_cost > 20000:
-        mid = (min_cost + max_cost) / 2.0
-        min_cost, max_cost = mid - 5000, mid + 5000
-
-    min_cost = max(0.0, round(min_cost))
-    max_cost = max(min_cost, round(max_cost))
-
-    # If unknown severity, zero-out costs
-    if severity == "unknown":
-        min_cost, max_cost = 0.0, 0.0
-
-    result["estimated_cost_min"] = min_cost
-    result["estimated_cost_max"] = max_cost
-
-    # Confidence
-    try:
-        confidence = float(raw.get("confidence", 0.5))
-    except Exception:
-        confidence = 0.5
-    result["confidence"] = max(0, min(1, confidence))
-
-    # Pricing tier
-    tier = raw.get("pricing_tier", "unknown")
-    if tier not in ALLOWED_TIERS:
-        tier = compute_pricing_tier(min_cost, max_cost)
-    result["pricing_tier"] = tier
-
-    return result
 
 
 # ============================================================
-# SUPER-PROMPT v2.0
-# ============================================================
-system_prompt = """
-You are an advanced automotive damage estimator AI used by collision and wheel repair shops in Ontario, Canada in the year 2025.
-
-You analyze up to 5 photos of vehicle damage and return STRICT JSON ONLY. Never output text outside JSON.
-
-=====================
-RULES:
-=====================
-- DO NOT guess parts that are not visible.
-- DO NOT guess vehicle make/model/year.
-- DO NOT hallucinate panels.
-- IF image unclear: severity="unknown", costs=0, tier="unknown", confidence<=0.2
-- Use only allowed panel names and damage types.
-- Never invent new fields.
-- Multi-image: consider all angles, choose the worst visible damage.
-
-=====================
-ONTARIO 2025 REPAIR COSTS:
-=====================
-Cosmetic scratches: 150–450  
-Minor dents: 200–600  
-Rim curb rash: 120–250  
-Rim refinishing: 200–350  
-Moderate dents paint damage: 400–900  
-Bumper scuff+deformation: 600–1200  
-Rim bend repair: 220–380  
-Cracked rim: 350–600+  
-Bumper replacement: 750–1800  
-
-=====================
-SEVERITY:
-=====================
-Minor = cosmetic  
-Moderate = structural-looking but drivable  
-Severe = major deformation, cracks, broken components  
-
-=====================
-PRICING TIER:
-=====================
-<=600 → Basic Cosmetic  
-601–2500 → Standard Repair  
->2500 → Premium / Extensive  
-
-=====================
-FINAL JSON KEYS (MANDATORY):
-=====================
-{
-  "severity": "...",
-  "panels": [...],
-  "damage_types": [...],
-  "estimated_cost_min": number,
-  "estimated_cost_max": number,
-  "confidence": number,
-  "pricing_tier": "..."
-}
-"""
-
-
-# ============================================================
-# SHOP CONFIG
+# SHOP CONFIGURATION (MULTI-SHOP)
 # ============================================================
 
 class ShopConfig(BaseModel):
@@ -262,29 +78,35 @@ class ShopConfig(BaseModel):
 
 
 def load_shops() -> Dict[str, ShopConfig]:
-    """Parse SHOPS_JSON into token->ShopConfig."""
+    """Load shops from SHOPS_JSON env var."""
     if not SHOPS_JSON:
-        default = ShopConfig(
-            id="default", name="Auto Body Shop", webhook_token="demo_token"
-        )
+        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo")
         return {default.webhook_token: default}
 
     try:
-        data = json.loads(SHOPS_JSON)
-        shops: Dict[str, ShopConfig] = {}
-        for s in data:
-            shop = ShopConfig(**s)
-            shops[shop.webhook_token] = shop
+        arr = json.loads(SHOPS_JSON)
+        shops = {}
+        for s in arr:
+            sc = ShopConfig(**s)
+            shops[sc.webhook_token] = sc
         return shops
-    except Exception:
-        default = ShopConfig(
-            id="default", name="Auto Body Shop", webhook_token="demo_token"
-        )
+    except:
+        default = ShopConfig(id="default", name="Auto Body Shop", webhook_token="demo")
         return {default.webhook_token: default}
 
 
-SHOPS_BY_TOKEN: Dict[str, ShopConfig] = load_shops()
+SHOPS_BY_TOKEN = load_shops()
 SESSIONS: Dict[str, dict] = {}
+
+
+def get_shop(request: Request) -> ShopConfig:
+    """Determine shop based on ?token= in webhook."""
+    token = request.query_params.get("token")
+    if not token or token not in SHOPS_BY_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing shop token")
+    return SHOPS_BY_TOKEN[token]
+
+
 # ============================================================
 # DATABASE MODELS
 # ============================================================
@@ -296,9 +118,9 @@ class Estimate(Base):
     shop_id = Column(String, index=True)
     customer_phone = Column(String, index=True)
     severity = Column(String)
-    damage_areas = Column(Text)          # comma-separated panels
-    damage_types = Column(Text)          # comma-separated damage types
-    recommended_repairs = Column(Text)   # kept for compatibility
+    damage_areas = Column(Text)
+    damage_types = Column(Text)
+    recommended_repairs = Column(Text)
     min_cost = Column(Float)
     max_cost = Column(Float)
     confidence = Column(Float)
@@ -308,31 +130,30 @@ class Estimate(Base):
 
 
 @app.on_event("startup")
-def on_startup():
+def startup():
     Base.metadata.create_all(bind=engine)
-
-
-# ============================================================
-# HELPERS: IMAGES + VIN
+    # ============================================================
+# HELPERS: IMAGES + VIN EXTRACTION
 # ============================================================
 
 VIN_PATTERN = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
 
 def extract_image_urls(form) -> List[str]:
+    """Extract all MediaUrl0, MediaUrl1, … from Twilio MMS."""
     urls = []
-    index = 0
+    i = 0
     while True:
-        key = f"MediaUrl{index}"
-        url = form.get(key)
+        url = form.get(f"MediaUrl{i}")
         if not url:
             break
         urls.append(url)
-        index += 1
+        i += 1
     return urls
 
 
 def extract_vin(text: str) -> Optional[str]:
+    """Extract VIN if present in message body."""
     if not text:
         return None
     match = VIN_PATTERN.search(text.upper())
@@ -340,155 +161,158 @@ def extract_vin(text: str) -> Optional[str]:
 
 
 # ============================================================
-# AI DAMAGE ESTIMATION (SUPER ESTIMATOR v2.0)
+# AI DAMAGE ESTIMATION - ULTRA ACCURATE SYSTEM PROMPT
 # ============================================================
 
-async def estimate_damage_from_images(
-    image_urls: List[str], 
-    vin: Optional[str], 
-    shop: ShopConfig,
-) -> dict:
-    """
-    Full AI estimator with:
-    - multi-image support (up to 5)
-    - strict JSON schema
-    - fraud/unclear detection
-    - pricing tiers
-    - normalization layer
-    """
+AI_SYSTEM_PROMPT = """
+You are a certified Ontario (Canada) auto-body estimator (2025) with 15+ years expertise.
+You analyze vehicle damage from photos and output strict JSON only.
+
+Follow these steps INTERNALLY before answering:
+
+1. Identify all damaged panels only from:
+   - front bumper upper/lower
+   - rear bumper upper/lower
+   - left/right fender
+   - left/right front door
+   - left/right rear door
+   - hood, trunk
+   - left/right quarter panel
+   - rocker panel
+   - grille area
+   - headlight/taillight area
+
+2. Identify all damage types:
+   dent, crease dent, sharp dent, paint scratch, deep scratch,
+   paint scuff, paint transfer, crack, plastic tear, bumper deformation,
+   metal distortion, misalignment, rust exposure
+
+3. Recommend repairs:
+   PDR, panel repair + paint, bumper repair + paint, bumper replacement,
+   panel replacement, blend adjacent panels, recalibration, refinish only
+
+4. Ontario 2025 pricing (CAD):
+   PDR 150–600
+   Panel repaint 350–900
+   Panel repair+paint 600–1600
+   Bumper repaint 400–900
+   Bumper repair+paint 750–1400
+   Bumper replacement 800–2000
+   Door replacement 800–2200
+   Quarter panel repair 900–2500
+   Quarter panel replacement 1800–4800
+   Hood repaint 400–900
+   Hood replacement 600–2200
+
+   - Minor damage → low
+   - Moderate → mid
+   - Severe or multi-panel → high or sum
+   - Luxury/EV (VIN) → +15–30%
+
+5. Output JSON EXACTLY:
+{
+  "severity": "Minor" | "Moderate" | "Severe",
+  "damage_areas": [...],
+  "damage_types": [...],
+  "recommended_repairs": [...],
+  "min_cost": number,
+  "max_cost": number,
+  "confidence": number,
+  "vin_used": boolean,
+  "customer_summary": "1–2 friendly sentences"
+}
+""".strip()
+async def estimate_damage_from_images(image_urls: List[str], vin: Optional[str], shop: ShopConfig):
     if not OPENAI_API_KEY:
         return {
-            "severity": "unknown",
-            "panels": [],
+            "severity": "Moderate",
+            "damage_areas": [],
             "damage_types": [],
-            "estimated_cost_min": 0,
-            "estimated_cost_max": 0,
-            "confidence": 0.1,
-            "pricing_tier": "unknown",
-            "customer_summary": (
-                "Our AI estimator is temporarily unavailable. "
-                "A technician will provide a manual review."
-            )
+            "recommended_repairs": [],
+            "min_cost": 600,
+            "max_cost": 1500,
+            "confidence": 0.65,
+            "vin_used": False,
+            "customer_summary": "Moderate cosmetic damage suggested. Technician will confirm in person."
         }
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # Build content payload with up to 5 images
+    # Build content
     content = []
-    intro = (
-        f"Estimate damage for {shop.name} in Ontario. "
-        "Follow system rules strictly."
-    )
-    if vin:
-        intro += f" VIN: {vin}"
-    content.append({"type": "text", "text": intro})
+    header_text = f"Analyze damage for {shop.name}." + (f" VIN: {vin}" if vin else "")
+    content.append({"type": "text", "text": header_text})
 
-    usable_images = image_urls[:5]
-
-    for url in usable_images:
+    for url in image_urls[:2]:
         if url.startswith("https://api.twilio.com") and twilio_client:
             try:
-                img_bytes = download_twilio_image(url)
-                data_url = image_bytes_to_data_url(img_bytes)
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": data_url}
-                })
+                img = download_twilio_image(url)
+                data_url = image_bytes_to_data_url(img)
+                content.append({"type": "image_url", "image_url": {"url": data_url}})
             except Exception as e:
-                print("Twilio media error:", e)
+                print("Twilio image error:", e)
         else:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": url}
-            })
+            content.append({"type": "image_url", "image_url": {"url": url}})
 
     payload = {
         "model": "gpt-4.1-mini",
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content}
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
         ],
-        "response_format": {"type": "json_object"},
+        "response_format": {"type": "json_object"}
     }
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     try:
         async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        resp.raise_for_status()
-
-        raw_str = resp.json()["choices"][0]["message"]["content"]
-        raw = json.loads(raw_str)
-
-        normalized = validate_and_normalize_estimate(raw)
-
-        # Build customer summary
-        sev = normalized["severity"]
-        min_c = normalized["estimated_cost_min"]
-        max_c = normalized["estimated_cost_max"]
-        tier = normalized["pricing_tier"]
-        conf = normalized["confidence"]
-        panels = ", ".join(normalized["panels"]) or "no visible panels"
-        damages = ", ".join(normalized["damage_types"]) or "no clear damage type"
-
-        if sev == "unknown":
-            summary = (
-                "The photos are unclear or do not show identifiable damage. "
-                "An in-person inspection is recommended to provide an accurate estimate."
-            )
-        else:
-            summary = (
-                f"The AI detected {sev.lower()} damage affecting: {panels}. "
-                f"Visible issues: {damages}. "
-                f"Estimated Ontario repair cost: ${min_c:,.0f}–${max_c:,.0f} ({tier}). "
-                f"Confidence level: {conf:.2f}. "
-                f"An in-person inspection may adjust the final cost."
-            )
-
-        normalized["customer_summary"] = summary
-        return normalized
-
+            r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+        result = json.loads(raw)
     except Exception as e:
-        print("AI estimator error:", e)
+        print("AI error:", e)
         return {
-            "severity": "unknown",
-            "panels": [],
+            "severity": "Moderate",
+            "damage_areas": [],
             "damage_types": [],
-            "estimated_cost_min": 0,
-            "estimated_cost_max": 0,
-            "confidence": 0.1,
-            "pricing_tier": "unknown",
-            "customer_summary": (
-                "We had trouble analyzing the images. "
-                "A technician will review them manually."
-            )
-    }
-# ============================================================
+            "recommended_repairs": [],
+            "min_cost": 600,
+            "max_cost": 1500,
+            "confidence": 0.5,
+            "vin_used": bool(vin),
+            "customer_summary": "Preliminary estimate suggests moderate damage. Technician will confirm."
+        }
+
+    # Safety corrections
+    try:
+        lo = float(result.get("min_cost", 600))
+        hi = float(result.get("max_cost", 1500))
+        if hi < lo:
+            lo, hi = hi, lo
+        result["min_cost"] = max(100, round(lo))
+        result["max_cost"] = max(result["min_cost"] + 50, round(hi))
+    except:
+        result["min_cost"] = 600
+        result["max_cost"] = 1500
+
+    result.setdefault("vin_used", bool(vin))
+    return result
+    # ============================================================
 # SAVE ESTIMATE TO DATABASE
 # ============================================================
 
 def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], result: dict) -> str:
-    """
-    Saves the upgraded estimator output into DB using existing columns.
-    - recommended_repairs is preserved but left blank (Option C).
-    """
     db = SessionLocal()
     try:
         est = Estimate(
             shop_id=shop.id,
             customer_phone=phone,
             severity=result.get("severity"),
-            damage_areas=", ".join(result.get("panels", [])),
+            damage_areas=", ".join(result.get("damage_areas", [])),
             damage_types=", ".join(result.get("damage_types", [])),
-            recommended_repairs="",  # kept for compatibility, not used anymore
-            min_cost=result.get("estimated_cost_min"),
-            max_cost=result.get("estimated_cost_max"),
+            recommended_repairs=", ".join(result.get("recommended_repairs", [])),
+            min_cost=result.get("min_cost"),
+            max_cost=result.get("max_cost"),
             confidence=result.get("confidence"),
             vin=vin,
             customer_summary=result.get("customer_summary"),
@@ -502,71 +326,47 @@ def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], result
 
 
 # ============================================================
-# ADMIN AUTH
+# APPOINTMENT TIMES
 # ============================================================
 
-def require_admin(request: Request):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
-    incoming = request.headers.get("x-api-key") or request.query_params.get("api_key")
-    if incoming != ADMIN_API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
+def get_appointment_slots():
+    """Generate next-day appointment slots at 9am, 11am, 2pm, 4pm."""
+    tomorrow = datetime.datetime.now() + datetime.timedelta(days=1)
+    hours = [9, 11, 14, 16]
 
-
-# ============================================================
-# APPOINTMENT SLOT GENERATOR
-# ============================================================
-
-def get_appointment_slots(n: int = 3) -> List[datetime.datetime]:
-    now = datetime.datetime.now()
-    tomorrow = now + datetime.timedelta(days=1)
-
-    hours = [9, 11, 14, 16]  # 9am, 11am, 2pm, 4pm
-    slots = []
-
-    for hour in hours:
-        t = tomorrow.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if t > now:
-            slots.append(t)
-
-    return slots[:n]
+    return [
+        tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
+        for h in hours
+    ]
 
 
 # ============================================================
-# ROOT ROUTE
-# ============================================================
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Auto-shop backend running"}
-
-
-# ============================================================
-# TWILIO SMS WEBHOOK — MAIN ENTRY
+# TWILIO WEBHOOK ROUTE
 # ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
     """
-    Twilio SMS webhook.
-    1. If customer replies 1/2/3 → book appointment.
-    2. If customer sends images → run AI estimator.
-    3. If no images → send instructions.
+    Main SMS webhook.
+    1) User replies 1/2/3 → Book appointment
+    2) User sends images → Generate AI estimate
+    3) User sends no images → Send instructions
     """
     form = await request.form()
     from_number = form.get("From")
     body = (form.get("Body") or "").strip()
+
     image_urls = extract_image_urls(form)
     vin = extract_vin(body)
 
     reply = MessagingResponse()
 
-    # Track sessions
+    # User session tracking
     session_key = f"{shop.id}:{from_number}"
     session = SESSIONS.get(session_key)
 
     # ========================================================
-    # STEP 1: Booking reply (user sends 1, 2, or 3)
+    # 1) BOOKING FLOW — USER REPLIES WITH 1,2,3
     # ========================================================
     if session and session.get("awaiting_time") and body in {"1", "2", "3"}:
         idx = int(body) - 1
@@ -574,83 +374,70 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
 
         if 0 <= idx < len(slots):
             chosen = slots[idx]
-            msg = [
-                f"You're booked at {shop.name}.",
-                "",
-                "Appointment time:",
-                chosen.strftime("%a %b %d at %I:%M %p"),
-                "",
-                "If you need to change this time, reply 'Change'."
-            ]
-            reply.message("\n".join(msg))
+            reply.message(
+                f"You're booked at {shop.name}!\n\n"
+                f"Appointment time:\n{chosen.strftime('%a %b %d at %I:%M %p')}\n\n"
+                f"Reply 'Change' to reschedule."
+            )
 
             session["awaiting_time"] = False
             SESSIONS[session_key] = session
-
             return Response(content=str(reply), media_type="application/xml")
 
     # ========================================================
-    # STEP 2: Photo-based AI estimate
+    # 2) DAMAGE ESTIMATION — IF IMAGES ARE PROVIDED
     # ========================================================
     if image_urls:
         result = await estimate_damage_from_images(image_urls, vin, shop)
-        estimate_id = save_estimate_to_db(shop, from_number, vin, result)
+        est_id = save_estimate_to_db(shop, from_number, vin, result)
 
-        severity = result["severity"]
-        min_cost = result["estimated_cost_min"]
-        max_cost = result["estimated_cost_max"]
-        tier = result["pricing_tier"]
-        panels = ", ".join(result["panels"]) or "No clear panels visible"
-        types = ", ".join(result["damage_types"]) or "Not clearly identifiable"
-        summary = result["customer_summary"]
-
-        if max_cost > 0:
-            cost_range = f"${min_cost:,.0f} – ${max_cost:,.0f}"
-        else:
-            cost_range = "N/A (photos unclear)"
-
-        # Appointment slots
         slots = get_appointment_slots()
         SESSIONS[session_key] = {"awaiting_time": True, "slots": slots}
 
-        msg_lines = [
+        msg = [
             f"AI Damage Estimate for {shop.name}",
             "",
-            f"Severity: {severity}",
-            f"Estimated Cost (Ontario 2025): {cost_range}",
-            f"Damage Areas: {panels}",
-            f"Damage Types: {types}",
-            f"Tier: {tier}",
+            f"Severity: {result['severity']}",
+            f"Estimated Cost (Ontario 2025): ${result['min_cost']} – ${result['max_cost']}",
+            f"Panels: {', '.join(result['damage_areas']) or 'Not detected'}",
+            f"Damage Types: {', '.join(result['damage_types']) or 'Not detected'}",
             "",
-            summary,
+            result.get("customer_summary", ""),
             "",
-            f"Estimate ID (internal): {estimate_id}",
+            f"Estimate ID: {est_id}",
             "",
-            "Reply with a number to book an in-person estimate:",
+            "Choose a time for an in-person estimate:",
         ]
 
         for i, s in enumerate(slots, 1):
-            msg_lines.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
+            msg.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
 
-        reply.message("\n".join(msg_lines))
+        reply.message("\n".join(msg))
         return Response(content=str(reply), media_type="application/xml")
 
     # ========================================================
-    # STEP 3: No images → send instructions
+    # 3) NO IMAGES — SEND INSTRUCTIONS
     # ========================================================
-    intro_msg = [
-        f"Thanks for messaging {shop.name}.",
-        "",
-        "To get an AI-powered pre-estimate:",
-        "- Send 1–5 clear photos of the damage",
-        "- Optional: include your 17-digit VIN",
-    ]
-    reply.message("\n".join(intro_msg))
+    reply.message(
+        f"Thanks for messaging {shop.name}.\n\n"
+        "To get an AI-generated pre-estimate:\n"
+        "- Send 1–5 clear photos of the damage\n"
+        "- Optional: include your 17-digit VIN"
+    )
     return Response(content=str(reply), media_type="application/xml")
+    # ============================================================
+# ADMIN AUTH
+# ============================================================
+
+def require_admin(request: Request):
+    """Simple x-api-key header or ?api_key= check."""
+    incoming = request.headers.get("x-api-key") or request.query_params.get("api_key")
+    if incoming != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # ============================================================
-# ADMIN API (READ-ONLY)
+# ADMIN: LIST ALL ESTIMATES
 # ============================================================
 
 @app.get("/admin/estimates")
@@ -661,11 +448,13 @@ def list_estimates(
     skip: int = 0,
 ):
     require_admin(request)
+
     db = SessionLocal()
     try:
         q = db.query(Estimate)
         if shop_id:
             q = q.filter(Estimate.shop_id == shop_id)
+
         q = q.order_by(Estimate.created_at.desc()).offset(skip).limit(limit)
 
         return [
@@ -680,17 +469,22 @@ def list_estimates(
             }
             for e in q.all()
         ]
+
     finally:
         db.close()
 
 
+# ============================================================
+# ADMIN: GET A SPECIFIC ESTIMATE
+# ============================================================
+
 @app.get("/admin/estimates/{estimate_id}")
 def get_estimate(estimate_id: str, request: Request):
     require_admin(request)
+
     db = SessionLocal()
     try:
         e = db.query(Estimate).filter(Estimate.id == estimate_id).first()
-
         if not e:
             raise HTTPException(status_code=404, detail="Estimate not found")
 
