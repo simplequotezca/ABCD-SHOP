@@ -1,166 +1,200 @@
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import Response, PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 from openai import OpenAI
-from pydantic import BaseModel
-import json
-import uuid
 import requests
+import json
 
 app = FastAPI()
 client = OpenAI()
 
-# -----------------------
-# SAFETY / VALIDATION RULES
-# -----------------------
+# ---------------------------------------------------------
+# ALLOWED DAMAGE AREAS (STRICT FILTER TO STOP BAD OUTPUTS)
+# ---------------------------------------------------------
 ALLOWED_AREAS = [
-    "front bumper upper", "front bumper lower", "rear bumper upper", "rear bumper lower",
-    "front left fender", "front right fender", "rear left fender", "rear right fender",
-    "front left door", "front right door", "rear left door", "rear right door",
+    "front bumper upper", "front bumper lower", 
+    "rear bumper upper", "rear bumper lower",
+    "front left fender", "front right fender",
+    "rear left fender", "rear right fender",
+    "front left door", "front right door",
+    "rear left door", "rear right door",
     "left quarter panel", "right quarter panel",
     "hood", "roof", "trunk", "tailgate",
     "windshield", "rear window", "left windows", "right windows",
     "left side mirror", "right side mirror",
     "left headlight", "right headlight",
     "left taillight", "right taillight",
-    "left front wheel", "right front wheel", 
+    "left front wheel", "right front wheel",
     "left rear wheel", "right rear wheel",
     "left front tire", "right front tire",
     "left rear tire", "right rear tire"
 ]
 
-def clean_area_list(text):
-    final = []
-    for a in ALLOWED_AREAS:
-        if a in text.lower():
-            final.append(a)
-    return list(set(final))
+
+def clean_area_list(text: str):
+    """Find ONLY allowed areas inside the AI text."""
+    text_lower = text.lower()
+    found = [a for a in ALLOWED_AREAS if a in text_lower]
+    return list(set(found))
 
 
-# -----------------------
-# STEP 1: PRE-SCAN PROMPT
-# -----------------------
+# ---------------------------------------------------------
+# PRE-SCAN PROMPT
+# ---------------------------------------------------------
 PRE_SCAN_PROMPT = """
-You are an automotive AI DAMAGE PRE-SCAN system.
+You are an automotive DAMAGE PRE-SCAN AI.
 
 Rules:
-1. ONLY list areas where visible damage is CLEAR.
-2. NEVER guess or mention areas that are not obviously damaged.
-3. Use simple bullet points.
-4. If unsure, say "uncertain".
+1. ONLY list areas where damage is clearly visible.
+2. DO NOT guess.
+3. DO NOT mention any areas not obviously damaged.
+4. If unsure, write 'uncertain'.
+5. Keep it short.
 
-Output format strictly:
+FORMAT STRICTLY:
+
 AREAS:
-- area 1
-- area 2
-- area 3
+- area1
+- area2
 
 NOTES:
-- short note here
+- short note
 """
 
-# -----------------------
-# STEP 2: FULL ESTIMATE PROMPT
-# -----------------------
+
+# ---------------------------------------------------------
+# FULL ESTIMATE PROMPT
+# ---------------------------------------------------------
 FULL_ESTIMATE_PROMPT = """
-You are an AI collision estimator for Ontario, Canada (2025).
-You must be extremely accurate and conservative.
+You are an AI collision estimator for Ontario (2025).
 
 Rules:
-1. ONLY use the confirmed areas from the user.
-2. DO NOT add new areas not confirmed.
+1. ONLY use the areas CONFIRMED by the user.
+2. Do NOT add new areas.
 3. Provide:
    - Severity
    - Cost range (Ontario 2025)
    - Damage types
-   - Short explanation
-4. Be realistic. No exaggeration.
+   - A simple explanation
 
-Format:
+FORMAT STRICTLY:
+
 AI Damage Estimate for {shop_name}
 
-Severity: <Mild/Moderate/Severe>
-Estimated Cost (Ontario 2025): $x – $y
+Severity: <severity>
+Estimated Cost (Ontario 2025): $X – $Y
 
 Areas:
-- area 1
-- area 2
+- area1
+- area2
 
 Damage Types:
-- type 1
-- type 2
+- type1
+- type2
 
 Explanation:
-<3–4 lines>
+3–4 short lines.
 """
 
-# -----------------------
-# STEP HANDLING
-# -----------------------
-sessions = {}  # phone → stored areas
+# ---------------------------------------------------------
+# SESSION MEMORY
+# ---------------------------------------------------------
+sessions = {}  # phone_number → confirmed_area_list
 
 
-@app.post("/sms")
+# ---------------------------------------------------------
+# SMS WEBHOOK ROUTE
+# ---------------------------------------------------------
+@app.post("/sms-webhook")
 async def sms_webhook(request: Request):
+
     form = await request.form()
-    body = form.get("Body", "").strip().lower()
+    body = (form.get("Body") or "").strip().lower()
     from_number = form.get("From")
     media_url = form.get("MediaUrl0")
 
     if not from_number:
-        return PlainTextResponse("Error: No phone number received")
+        return PlainTextResponse("Error: Missing phone number.")
 
-    # Start new thread
-    if body == "hi" or body == "start":
+    # ---------------------------
+    # START MESSAGE
+    # ---------------------------
+    if body in ["hi", "start"]:
         return PlainTextResponse(
-            "Send me a photo of your vehicle damage to begin a Pre-Scan."
+            "Send me a clear photo of your vehicle damage to begin a Pre-Scan."
         )
 
-    # Photo received → PRE-SCAN
+    # ---------------------------
+    # PRE-SCAN (PHOTO RECEIVED)
+    # ---------------------------
     if media_url:
-        img_bytes = requests.get(media_url).content
+        print("Processing PRE-SCAN for:", media_url)
 
-        pre_scan = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
+        # Call OpenAI "responses" API (correct 2025 format)
+        pre_scan = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
                 {"role": "system", "content": PRE_SCAN_PROMPT},
-                {"role": "user", "content": "Analyze this image for damage."},
-                {"role": "user", "content": [{"type": "image_url", "image_url": media_url}]}
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Analyze this image for visible vehicle damage only."},
+                        {"type": "input_image", "image_url": media_url}
+                    ]
+                }
             ]
         )
 
-        text = pre_scan.choices[0].message.content
-
-        # Extract allowed areas only
+        text = pre_scan.output_text
         confirmed = clean_area_list(text)
         sessions[from_number] = confirmed
 
-        reply = "AI Pre-Scan:\nI can see damage in these areas:\n"
-        if confirmed:
-            for c in confirmed:
-                reply += f"- {c}\n"
-        else:
-            reply += "- No clear damage detected\n"
+        reply = "AI Pre-Scan Results:\nI can clearly see damage in:\n"
 
-        reply += "\nReply 1 if this is correct.\nReply 2 to resend a clearer photo."
+        if confirmed:
+            for a in confirmed:
+                reply += f"- {a}\n"
+        else:
+            reply += "- No clearly visible damage detected\n"
+
+        reply += (
+            "\nReply 1 if this is correct.\n"
+            "Reply 2 if wrong and you'll send a clearer photo."
+        )
 
         return PlainTextResponse(reply)
 
-    # Step 2 confirmation:
+    # ---------------------------
+    # USER CONFIRMS → FINAL ESTIMATE
+    # ---------------------------
     if body == "1":
+
         confirmed_areas = sessions.get(from_number, [])
 
-        full_estimate = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": FULL_ESTIMATE_PROMPT.format(shop_name="Mississauga Collision Centre")},
-                {"role": "user", "content": f"Confirmed areas: {confirmed_areas}"}
-            ]
+        estimate = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": FULL_ESTIMATE_PROMPT.format(
+                        shop_name="Mississauga Collision Centre"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Confirmed areas: {confirmed_areas}",
+                },
+            ],
         )
 
-        output = full_estimate.choices[0].message.content
-        return PlainTextResponse(output)
+        return PlainTextResponse(estimate.output_text)
 
+    # ---------------------------
+    # USER REJECTS → RESEND PHOTO
+    # ---------------------------
     if body == "2":
-        return PlainTextResponse("Okay — please resend a clearer photo.")
+        return PlainTextResponse("Okay. Please send a clearer photo.")
 
+    # ---------------------------
+    # DEFAULT
+    # ---------------------------
     return PlainTextResponse("Please send a vehicle damage photo to begin.")
