@@ -81,18 +81,27 @@ def image_bytes_to_data_url(image_bytes: bytes) -> str:
 
 
 # ============================================================
-# SHOP CONFIG
+# SHOP CONFIG (MULTI-SHOP SUPPORT)
 # ============================================================
 
 class ShopConfig(BaseModel):
     id: str
     name: str
     webhook_token: str
-    # extra keys (like calendar_id) in SHOPS_JSON will be ignored by Pydantic
+    calendar_id: Optional[str] = None  # reserved for future Google Calendar link
 
 
 def load_shops() -> Dict[str, ShopConfig]:
-    """Parse SHOPS_JSON env var into token->ShopConfig map."""
+    """
+    Parse SHOPS_JSON env var into token->ShopConfig map.
+
+    SHOPS_JSON example:
+
+    [
+      { "id": "shop1", "name": "Brampton Auto Body", "webhook_token": "brampton123" },
+      { "id": "shop2", "name": "Mississauga Collision Centre", "webhook_token": "miss_centre_456" }
+    ]
+    """
     if not SHOPS_JSON:
         default = ShopConfig(
             id="default", name="Auto Body Shop", webhook_token="demo_token"
@@ -190,158 +199,192 @@ def extract_vin(text: str) -> Optional[str]:
 
 
 # ============================================================
-# CONSTANTS FOR POST-PROCESSING
+# PANEL GROUPING + COST CALIBRATION HELPERS
 # ============================================================
 
-SEVERITY_LEVELS = ["Minor", "Moderate", "Severe"]
-
-WHEEL_KEYWORDS = ("wheel", "rim", "tyre", "tire")
-GLASS_KEYWORDS = ("windshield", "rear glass", "window", "glass", "sunroof")
-
-WHEEL_DAMAGE_TYPES = {"paint scuff", "paint scratch", "curb rash", "chip", "gouge"}
-STRUCTURAL_DAMAGE_TYPES = {
-    "plastic tear",
-    "metal distortion",
-    "bumper deformation",
-    "frame damage",
-    "glass crack",
-    "glass shatter",
+# Map panel names (substrings) to high-level zones
+PANEL_ZONES = {
+    "front bumper": "front",
+    "rear bumper": "rear",
+    "hood": "front",
+    "grille": "front",
+    "headlight": "front",
+    "taillight": "rear",
+    "trunk": "rear",
+    "decklid": "rear",
+    "roof": "roof",
+    "windshield": "glass_front",
+    "back glass": "glass_rear",
+    "rear glass": "glass_rear",
+    "quarter panel": "rear_side",
+    "fender": "front_side",
+    "rocker": "side_lower",
+    "sill": "side_lower",
+    "door": "side",
+    "pillar": "structure",
+    "wheel": "wheel",
+    "rim": "wheel",
+    "tire": "wheel",
+    "sunroof": "roof",
+    "moonroof": "roof",
 }
 
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def is_wheel_only(areas: List[str]) -> bool:
-    if not areas:
-        return False
-    areas_l = [a.lower() for a in areas]
-    return all(any(k in a for k in WHEEL_KEYWORDS) for a in areas_l)
+WHEEL_KEYWORDS = ["wheel", "rim", "tire"]
+ROOF_KEYWORDS = ["roof", "roof rail", "sunroof", "moonroof"]
 
 
-def postprocess_damage_result(raw: dict) -> dict:
+def classify_panel_zone(name: str) -> str:
+    n = name.lower()
+    for key, zone in PANEL_ZONES.items():
+        if key in n:
+            return zone
+    return "unknown"
+
+
+def contains_any(text: str, keywords: List[str]) -> bool:
+    t = text.lower()
+    return any(k in t for k in keywords)
+
+
+def list_contains_any(items: List[str], keywords: List[str]) -> bool:
+    return any(contains_any(x, keywords) for x in items)
+
+
+def postprocess_cost_and_panels(
+    raw: dict,
+    vin: Optional[str],
+    image_count: int,
+) -> dict:
     """
-    Tighten the AI output so results are realistic for Ontario 2025
-    body-shops, with special handling for wheel-only, light damage, etc.
+    Final "brains" layer:
+    - cleans up weird panel mixes (front vs rear vs roof vs wheel)
+    - tightens cost ranges for simple jobs
+    - clamps obviously insane values
     """
-    result = dict(raw)  # shallow copy so we can modify safely
 
-    # 1) Prefer visible_areas over generic damage_areas
-    damage_areas = result.get("visible_areas") or result.get("damage_areas") or []
-    if not isinstance(damage_areas, list):
-        damage_areas = []
-    damage_areas = [a.strip() for a in damage_areas if isinstance(a, str) and a.strip()]
-    result["damage_areas"] = damage_areas
+    # --- Basic defaults ---
+    severity = (raw.get("severity") or "Moderate").title()
+    damage_areas: List[str] = [a.strip() for a in raw.get("damage_areas", []) if a]
+    damage_types: List[str] = [t.strip() for t in raw.get("damage_types", []) if t]
+    recommended_repairs: List[str] = [
+        r.strip() for r in raw.get("recommended_repairs", []) if r
+    ]
 
-    # 2) Normalize damage_types
-    damage_types = result.get("damage_types") or []
-    if not isinstance(damage_types, list):
-        damage_types = []
-    damage_types = [t.strip() for t in damage_types if isinstance(t, str) and t.strip()]
-    result["damage_types"] = damage_types
+    # --- Zone voting (front / rear / side / roof / wheel etc.) ---
+    zone_counts: Dict[str, int] = {}
+    for a in damage_areas:
+        z = classify_panel_zone(a)
+        zone_counts[z] = zone_counts.get(z, 0) + 1
 
-    # 3) Normalize recommended_repairs
-    rec_repairs = result.get("recommended_repairs") or []
-    if not isinstance(rec_repairs, list):
-        rec_repairs = []
-    rec_repairs = [r.strip() for r in rec_repairs if isinstance(r, str) and r.strip()]
-    result["recommended_repairs"] = rec_repairs
+    dominant_zone = None
+    if zone_counts:
+        dominant_zone = max(zone_counts.items(), key=lambda x: x[1])[0]
 
-    # 4) Normalize severity
-    severity = result.get("severity") or "Moderate"
-    if severity not in SEVERITY_LEVELS:
-        # Try case-insensitive match
-        sev_lower = severity.lower()
-        if "minor" in sev_lower:
-            severity = "Minor"
-        elif "severe" in sev_lower:
-            severity = "Severe"
-        else:
-            severity = "Moderate"
-    result["severity"] = severity
-
-    # 5) Normalize costs
-    try:
-        min_cost = float(result.get("min_cost", 600.0))
-        max_cost = float(result.get("max_cost", 1500.0))
-    except Exception:
-        min_cost, max_cost = 600.0, 1500.0
-
-    if max_cost < min_cost:
-        min_cost, max_cost = max_cost, min_cost
-
-    # Hard sanity: estimates shouldn't be insane for SMS pre-quotes
-    min_cost = clamp(min_cost, 50.0, 15000.0)
-    max_cost = clamp(max_cost, min_cost + 50.0, 20000.0)
-
-    # 6) Special: wheel-only damage sanity
-    if is_wheel_only(damage_areas):
-        # Pure cosmetic wheel/tire damage should not be a $5k+ severe estimate
-        cosmetic = all(
-            (t.lower() in WHEEL_DAMAGE_TYPES) or ("scuff" in t.lower())
-            for t in damage_types
-        ) or not damage_types
-
-        if cosmetic:
-            severity = "Minor"
-            # Typical Ontario retail: wheel refinish/repair per wheel
-            # We'll assume 1–2 wheels from a single photo
-            min_cost = 180.0
-            max_cost = 850.0
-
-        result["severity"] = severity
-        result["min_cost"] = round(min_cost)
-        result["max_cost"] = round(max_cost)
-        # Confidence can stay, but if missing, set mid
-        result["confidence"] = float(result.get("confidence", 0.75))
-        return result
-
-    # 7) General logic: if really low money, don't call it Severe
-    if max_cost <= 1000.0 and severity == "Severe":
-        severity = "Moderate"
-    if max_cost <= 600.0 and severity == "Moderate":
-        severity = "Minor"
-
-    # 8) If very high $$ and obvious structural damage, bump severity up
-    if max_cost >= 4000.0 and any(
-        s in {t.lower() for t in damage_types} for s in STRUCTURAL_DAMAGE_TYPES
-    ):
-        severity = "Severe"
-
-    result["severity"] = severity
-
-    # 9) Clamp band width to something reasonable (no $0–$20k swings)
-    if max_cost - min_cost > 8000.0:
-        mid = (min_cost + max_cost) / 2.0
-        min_cost = max(200.0, mid - 2500.0)
-        max_cost = mid + 2500.0
-
-    result["min_cost"] = round(min_cost)
-    result["max_cost"] = round(max_cost)
-
-    # 10) Confidence default
-    try:
-        conf = float(result.get("confidence", 0.75))
-    except Exception:
-        conf = 0.75
-    result["confidence"] = clamp(conf, 0.2, 0.99)
-
-    # 11) Ensure vin_used is boolean
-    result["vin_used"] = bool(result.get("vin_used", False))
-
-    # 12) Customer summary fallback
-    if not result.get("customer_summary"):
-        result["customer_summary"] = (
-            "This is an AI-based pre-estimate. A technician will confirm final "
-            "pricing after an in-person inspection."
+    # --- Heuristic: if we clearly have wheels only, drop random bumpers, etc. ---
+    if damage_areas:
+        wheel_only_image = list_contains_any(damage_areas, WHEEL_KEYWORDS) and not (
+            list_contains_any(damage_areas, ROOF_KEYWORDS)
         )
 
+        if wheel_only_image:
+            # If it's basically curb rash, we expect only wheel / tire related panels.
+            filtered = []
+            for a in damage_areas:
+                if list_contains_any([a], WHEEL_KEYWORDS):
+                    filtered.append(a)
+            if filtered:
+                damage_areas = filtered
+
+    # --- Heuristic: if roof dominates, suppress unrelated rear/front panels ---
+    if dominant_zone == "roof":
+        filtered = []
+        for a in damage_areas:
+            z = classify_panel_zone(a)
+            if z in ("roof", "glass_front", "glass_rear", "structure"):
+                filtered.append(a)
+        if filtered:
+            damage_areas = filtered
+
+    # --- Rear vs front dominance cleanup ---
+    if zone_counts.get("rear", 0) >= 2 and zone_counts.get("front", 0) == 1:
+        # Probably a rear impact with a spurious "front bumper" mention.
+        damage_areas = [
+            a for a in damage_areas if classify_panel_zone(a) != "front"
+        ]
+    if zone_counts.get("front", 0) >= 2 and zone_counts.get("rear", 0) == 1:
+        damage_areas = [
+            a for a in damage_areas if classify_panel_zone(a) != "rear"
+        ]
+
+    # --- Cost sanity & specialization ---
+    try:
+        min_c = float(raw.get("min_cost", 600))
+        max_c = float(raw.get("max_cost", 1500))
+    except Exception:
+        min_c, max_c = 600.0, 1500.0
+
+    # Ensure min <= max
+    if max_c < min_c:
+        min_c, max_c = max_c, min_c
+
+    # Global clamp to keep values sane
+    # (Sub-100 is unrealistic; 20k is overkill for SMS pre-estimates)
+    min_c = max(80.0, min_c)
+    max_c = min(20000.0, max_c)
+
+    # --- Special case: curb rash / wheel focus ---
+    if list_contains_any(damage_areas, WHEEL_KEYWORDS) and len(damage_areas) <= 2:
+        # Estimate for wheel refinishing / minor tire replacement.
+        if severity.lower() == "minor":
+            min_c, max_c = 150.0, 450.0
+        elif severity.lower() == "moderate":
+            min_c, max_c = 300.0, 900.0
+        else:
+            min_c, max_c = 400.0, 1200.0
+
+    # --- Special case: roof-only or roof + glass ---
+    if list_contains_any(damage_areas, ROOF_KEYWORDS) and not list_contains_any(
+        damage_areas, WHEEL_KEYWORDS
+    ):
+        if severity.lower() == "minor":
+            min_c, max_c = 600.0, 1600.0
+        elif severity.lower() == "moderate":
+            min_c, max_c = 1200.0, 2800.0
+        else:
+            min_c, max_c = 2000.0, 4800.0
+
+    # --- Special case: heavy rear or front smash (>=3 panels, severe) ---
+    rear_panels = [a for a in damage_areas if classify_panel_zone(a) in ("rear", "rear_side", "glass_rear")]
+    front_panels = [a for a in damage_areas if classify_panel_zone(a) in ("front", "front_side", "glass_front")]
+
+    if severity.lower() == "severe" and (len(rear_panels) >= 3 or len(front_panels) >= 3):
+        # Big collision; ensure we are not underpricing.
+        min_c = max(min_c, 2500.0)
+        max_c = max(max_c, min_c + 800.0)
+
+    # --- Reasonable spread: keep range within 5k unless truly severe ---
+    spread = max_c - min_c
+    if spread > 5000.0:
+        mid = (min_c + max_c) / 2
+        min_c = max(100.0, mid - 2500.0)
+        max_c = mid + 2500.0
+
+    # Round to nearest 10 for nicer SMS display
+    min_c = round(min_c / 10.0) * 10.0
+    max_c = round(max_c / 10.0) * 10.0
+
+    result = dict(raw)
+    result["severity"] = severity
+    result["damage_areas"] = damage_areas
+    result["damage_types"] = damage_types
+    result["recommended_repairs"] = recommended_repairs
+    result["min_cost"] = float(min_c)
+    result["max_cost"] = float(max_c)
     return result
 
 
 # ============================================================
-# AI DAMAGE ESTIMATION (ONTARIO 2025, MULTI-IMAGE + TWILIO MEDIA)
+# AI DAMAGE ESTIMATION (ONTARIO 2025, MULTI-IMAGE, ULTRA PROMPT)
 # ============================================================
 
 async def estimate_damage_from_images(
@@ -370,97 +413,126 @@ async def estimate_damage_from_images(
             ),
         }
 
-    system_prompt = '''
-You are a certified Ontario (Canada) auto-body damage estimator in the year 2025
-with 15+ years of experience. You estimate collision and cosmetic repairs
-for retail customers (no deep insurance discounts).
+    # Ultra-detailed system prompt: multi-image, full vehicle coverage, strict no-hallucination
+    system_prompt = """
+You are a MASTER collision estimator in Ontario, Canada, year 2025,
+with 15+ years of professional auto body and collision repair experience.
 
-You are given multiple PHOTOS of vehicle damage, and sometimes a VIN.
-Your job is to produce a conservative but realistic PRE-ESTIMATE, not a full DRP sheet.
+Your job: from PHOTOS ONLY (and an optional VIN), produce a realistic, shop-ready
+pre-estimate for a retail customer (NO deep insurance discounts).
 
-CRITICAL RULES ABOUT WHAT YOU CAN SAY
-------------------------------------
-1) ONLY describe panels and parts that are clearly visible in the photos.
-   - If you cannot clearly see a part, DO NOT list it in "visible_areas".
-   - Do NOT assume front damage from a rear photo or vice versa.
-   - Do NOT assume the opposite side is damaged if you cannot see it.
+You must be:
+- CONSERVATIVE but REALISTIC
+- Extremely careful to NOT invent panels or damage you cannot clearly see
+- Very strict about front vs rear vs roof vs side
+- Able to handle: sedans, coupes, hatchbacks, SUVs, vans, and pickup trucks
 
-2) If the photo shows ONLY a wheel/rim/tire:
-   - Limit "visible_areas" to that wheel/rim/tire.
-   - Do NOT add bumpers, fenders, doors, or lights unless they are clearly damaged in the photo.
+You will receive 1–5 photos of a vehicle.
+Sometimes they are close-ups (e.g., wheel, door corner, roof dent).
+Sometimes they are wider shots (front end crash, rear end crash, etc).
 
-3) If you are uncertain:
-   - Use "possible_hidden_areas" for educated guesses,
-     but keep "visible_areas" STRICTLY to what you clearly see.
+-------------------------------------------------------------------------------
+STEP 0: GLOBAL PRINCIPLES
+-------------------------------------------------------------------------------
+1) NEVER GUESS panels that are not clearly visible.
+   - If you see only a rear bumper and trunk → DO NOT mention front bumper.
+   - If the photo is only a wheel close-up → DO NOT mention fenders or bumpers.
+   - If the photo is only roof and a bit of glass → DO NOT mention doors or bumpers.
+2) If unsure whether a panel is actually damaged, LEAVE IT OUT.
+   - It is BETTER to UNDER-LIST panels than to hallucinate new ones.
+3) Each damaged panel must be a REAL, specific automotive area.
 
-4) This is for pro body shops. They care that:
-   - Damage labels (panels/areas) match what’s actually in the picture.
-   - Cost bands are realistic for Ontario 2025 retail rates.
+-------------------------------------------------------------------------------
+STEP 1: PER-IMAGE ANALYSIS (YOU DO THIS INTERNALLY)
+-------------------------------------------------------------------------------
+For each image you receive, you internally identify:
+- which panels are visible
+- which panels clearly show damage
+- how large the damage is on that panel (approx % of surface)
+- what types of damage occur (dent, scratch, crack, scuff, rust, etc.)
+You then MERGE these into a single global picture of the vehicle damage,
+avoiding double-counting the same dent across different angles.
 
-PANEL / AREA VOCABULARY
------------------------
-When listing areas, only use items from this controlled vocabulary
-and only if they are ACTUALLY VISIBLE in the photos:
+-------------------------------------------------------------------------------
+STEP 2: ALLOWED PANEL NAMES (USE THESE WORDINGS)
+-------------------------------------------------------------------------------
+When you output damage_areas, you must select from / adapt to the closest of:
 
-FRONT:
+FRONT / REAR BUMPERS:
 - front bumper upper
 - front bumper lower
-- grille area
-- hood
-- left front fender
-- right front fender
-- left headlight
-- right headlight
-- front left wheel / rim
-- front right wheel / rim
-- front left tire
-- front right tire
-- left mirror
-- right mirror
-- front windshield
-
-SIDE / BODY:
-- left front door
-- right front door
-- left rear door
-- right rear door
-- left rocker panel
-- right rocker panel
-- left quarter panel
-- right quarter panel
-- roof
-- left front window
-- right front window
-- left rear window
-- right rear window
-
-REAR:
 - rear bumper upper
 - rear bumper lower
-- trunk
-- rear glass
-- left taillight
-- right taillight
-- rear left wheel / rim
-- rear right wheel / rim
-- rear left tire
-- rear right tire
 
-WHEEL / TIRE ONLY:
-- front left wheel / rim
-- front right wheel / rim
-- rear left wheel / rim
-- rear right wheel / rim
-- front left tire
-- front right tire
-- rear left tire
-- rear right tire
+HOOD / TRUNK / ROOF:
+- hood
+- trunk lid / decklid
+- roof
+- roof rail left
+- roof rail right
 
-DAMAGE TYPE VOCABULARY
-----------------------
-Choose all that apply, only if you can really see them:
+FRONT & REAR STRUCTURE / LIGHTS:
+- grille area
+- left headlight area
+- right headlight area
+- left fog light area
+- right fog light area
+- left taillight area
+- right taillight area
+
+SIDE PANELS:
+- left fender
+- right fender
+- left front door outer panel
+- right front door outer panel
+- left rear door outer panel
+- right rear door outer panel
+- left quarter panel
+- right quarter panel
+- left rocker panel / sill
+- right rocker panel / sill
+- left A-pillar
+- right A-pillar
+- left B-pillar
+- right B-pillar
+- left C-pillar
+- right C-pillar
+
+WHEELS / TIRES:
+- left front wheel / rim
+- right front wheel / rim
+- left rear wheel / rim
+- right rear wheel / rim
+- left front tire
+- right front tire
+- left rear tire
+- right rear tire
+
+GLASS:
+- windshield
+- back glass / rear window
+- left front door glass
+- right front door glass
+- left rear door glass
+- right rear door glass
+- left quarter glass
+- right quarter glass
+- sunroof / moonroof glass
+
+MIRRORS:
+- left side mirror
+- right side mirror
+
+If a very close panel does not fit exactly, choose the CLOSEST accurate label.
+Do NOT invent “generic” labels like “general body damage”.
+
+-------------------------------------------------------------------------------
+STEP 3: ALLOWED DAMAGE TYPES
+-------------------------------------------------------------------------------
+Use one or more of:
 
 - dent
+- deep dent
 - crease dent
 - sharp dent
 - paint scratch
@@ -468,19 +540,49 @@ Choose all that apply, only if you can really see them:
 - paint scuff
 - paint transfer
 - crack
+- glass crack
+- glass chip
 - plastic tear
 - bumper deformation
 - metal distortion
 - misalignment
 - rust exposure
-- curb rash
-- glass chip
-- glass crack
-- glass shatter
+- panel distortion
+- hole / puncture
+- peeling clearcoat
 
-REPAIR METHOD VOCABULARY
-------------------------
-Choose all that apply:
+If you cannot clearly see a given type, DO NOT list it.
+
+-------------------------------------------------------------------------------
+STEP 4: DETERMINE IMPACT PATTERN (INTERNAL REASONING)
+-------------------------------------------------------------------------------
+From all images together, infer the MAIN impact pattern:
+
+impact_location (choose best fit):
+- "front"
+- "rear"
+- "left_side"
+- "right_side"
+- "roof"
+- "multi_zone"
+
+impact_type (free text, but concise), e.g.:
+- "rear-end collision"
+- "front-end collision"
+- "side swipe"
+- "parking pole impact"
+- "curb impact on wheel"
+- "object falling on roof"
+- "hail-type roof damage"
+- "minor parking scrape"
+
+Use this only to guide severity and repair strategy.
+Do NOT hallucinate other panels just because of impact_type.
+
+-------------------------------------------------------------------------------
+STEP 5: REPAIR OPERATIONS (SHOP LANGUAGE)
+-------------------------------------------------------------------------------
+Use any that apply:
 
 - PDR (paintless dent repair)
 - panel repair + paint
@@ -489,73 +591,113 @@ Choose all that apply:
 - panel replacement
 - blend adjacent panels
 - refinish wheel
-- replace wheel
-- tire replacement
+- wheel replacement
 - glass chip repair
 - glass replacement
-- recalibration (sensors/cameras)
-- refinish only (no structural repair)
+- headlight replacement
+- taillight replacement
+- mirror replacement
+- roof repair + repaint
+- trunk lid repair + repaint
+- hood repair + repaint
+- sensor / camera recalibration
+- structural inspection
 
-ONTARIO 2025 PRICING GUIDANCE (CAD, RETAIL)
--------------------------------------------
-Use these as reference ranges for pre-estimates:
+-------------------------------------------------------------------------------
+STEP 6: ONTARIO 2025 RETAIL PRICING (CAD, CUSTOMER PAY)
+-------------------------------------------------------------------------------
+Use typical Ontario BODY SHOP retail pricing ranges (not insurance discounts):
 
-- PDR (small dent):          150–600
-- Panel repaint only:        350–900
-- Panel repair + repaint:    600–1600
-- Bumper repaint:            400–900
-- Bumper repair + paint:     750–1400
-- Bumper replacement:        800–2200
-- Door replacement:          800–2200
-- Quarter panel repair:      900–2500
-- Quarter panel replacement: 1800–4800
-- Hood repaint:              400–900
-- Hood replacement:          600–2200
-- Wheel refinish:            180–450 per wheel
-- Wheel replacement:         450–1200 per wheel
-- Windshield replacement:    450–1200
-- Glass chip repair:         80–250
+ROUGH UNIT PRICES:
+- PDR, small: 150–400
+- PDR, larger/complex: 300–800
+- Panel repaint (no repair): 350–900
+- Panel repair + repaint: 600–1,600
+- Bumper repaint only: 400–900
+- Bumper repair + repaint: 750–1,400
+- Bumper replacement + paint + install: 1,200–2,800
+- Door repair + repaint: 700–1,800
+- Door replacement + paint + install: 1,500–3,200
+- Quarter panel repair: 900–2,500
+- Quarter panel replacement: 1,800–4,800
+- Hood repaint: 400–1,000
+- Hood replacement: 700–2,400
+- Roof repair + repaint: 1,200–4,000
+- Roof replacement (rare, heavy): 3,000–8,000
+- Wheel refinish (per wheel): 180–450
+- Wheel replacement (per wheel, typical alloy): 450–900
+- Windshield replacement: 450–1,100
+- Back glass replacement: 500–1,200
+- Door glass replacement: 350–800
+- Headlight replacement (each, with aiming): 300–900
+- Taillight replacement (each): 220–650
+- Sensor/camera recalibration package: 250–600
 
-Rules:
-- Minor, isolated cosmetic damage → low end
-- Moderate multi-panel damage → mid range
-- Heavy structural / multiple panels / glass + panels → high end
-- If VIN indicates luxury/EV/aluminum, it’s okay to bias 15–30% higher,
-  but still stay realistic for a pre-estimate.
+RULES:
+- Use realistic combinations of these operations.
+- Minor cosmetic = low end of ranges.
+- Clearly severe or multiple panels = high end or sum of multiple operations.
+- If VIN or brand suggests luxury/EV/aluminum, bias 15–30% higher.
+- DO NOT exceed 20,000 CAD total for an SMS pre-estimate.
+- DO NOT go below 80 CAD.
 
-VIN USAGE
----------
-If a VIN is provided:
-- Infer vehicle segment (economy / mid-range / luxury / truck / EV).
-- Adjust cost band appropriately.
-- Set "vin_used" to true only if VIN actually influenced your pricing.
+-------------------------------------------------------------------------------
+STEP 7: SEVERITY
+-------------------------------------------------------------------------------
+Choose ONE:
 
-OUTPUT FORMAT (VERY IMPORTANT)
-------------------------------
-You MUST return VALID JSON ONLY, with EXACTLY these keys:
+- "Minor"   = cosmetic, limited area, no obvious structural or glass breakage
+- "Moderate"= multiple panels OR deeper dents OR some plastic tears / cracks
+- "Severe"  = heavy deformation, multiple major panels, significant glass or structure
+
+-------------------------------------------------------------------------------
+STEP 8: VIN HANDLING
+-------------------------------------------------------------------------------
+If a VIN is provided, infer only broad category:
+- economy
+- mid-range
+- luxury
+- pickup / truck
+- EV
+
+Adjust the estimate level slightly (economy → lower range, luxury/EV → higher).
+
+-------------------------------------------------------------------------------
+STEP 9: ENSEMBLE ESTIMATE (INTERNAL)
+-------------------------------------------------------------------------------
+Internally, you imagine three estimators:
+- Estimator A: conservative lower-bound
+- Estimator B: typical mid-range
+- Estimator C: high-end shop pricing
+
+You then output:
+- min_cost = near A
+- max_cost = near C
+But keep them realistic and consistent with operations and severity.
+
+-------------------------------------------------------------------------------
+STEP 10: OUTPUT FORMAT (MUST BE STRICT JSON)
+-------------------------------------------------------------------------------
+Return ONLY a single JSON object with exactly these keys:
 
 {
-  "severity": "Minor" | "Moderate" | "Severe",
-  "visible_areas": [ "rear bumper lower", "left quarter panel", ... ],
-  "possible_hidden_areas": [ "rear body structure behind bumper", ... ],
-  "damage_types": [ "dent", "paint scratch", ... ],
-  "recommended_repairs": [ "bumper repair + paint", "refinish wheel", ... ],
+  "severity": "Minor | Moderate | Severe",
+  "damage_areas": [ "...", "..." ],
+  "damage_types": [ "...", "..." ],
+  "recommended_repairs": [ "...", "..." ],
   "min_cost": number,
   "max_cost": number,
-  "confidence": number,
-  "vin_used": boolean,
-  "customer_summary": "1–3 sentence explanation in friendly language",
-  "reasoning_notes": "Very short internal notes about why you chose panels, severity, and cost."
+  "confidence": number,      // 0.0–1.0, how confident you are overall
+  "vin_used": boolean,       // true if VIN influenced pricing
+  "impact_location": "front|rear|left_side|right_side|roof|multi_zone",
+  "impact_type": "short phrase describing the scenario",
+  "customer_summary": "1–3 sentence friendly explanation for the vehicle owner"
 }
 
-STRICT VISIBILITY RULE:
-- "visible_areas" must ONLY contain panels you can literally see and identify in the photos.
-- Use "possible_hidden_areas" for anything that is a guess or might be behind trim.
-- NEVER invent front-end damage from a rear-only photo, or vice versa.
-- NEVER add more wheels/tires than are clearly visible.
-
-Think slowly, like a professional estimator, then output ONLY the JSON.
-'''.strip()
+IMPORTANT:
+- JSON ONLY. No extra commentary, no markdown.
+- Only include panels and damage you CLEARLY SEE in the provided images.
+""".strip()
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -565,14 +707,14 @@ Think slowly, like a professional estimator, then output ONLY the JSON.
     # Build OpenAI content payload
     content: List[dict] = []
     main_text = (
-        f"Analyze these vehicle damage photos for {shop.name} "
-        "and follow ALL instructions in the system prompt very carefully."
+        f"Analyze these vehicle damage photos for {shop.name}. "
+        "Follow the multi-step instructions carefully and return ONLY the JSON object."
     )
     if vin:
         main_text += f" The VIN for this vehicle is: {vin}."
     content.append({"type": "text", "text": main_text})
 
-    # Use at most 3 images per request to keep latency and cost reasonable
+    # Use at most 3 images per request to balance cost vs accuracy
     usable_urls = image_urls[:3]
 
     for url in usable_urls:
@@ -605,10 +747,32 @@ Think slowly, like a professional estimator, then output ONLY the JSON.
         resp.raise_for_status()
         data = resp.json()
         raw_content = data["choices"][0]["message"]["content"]
-        raw_result = json.loads(raw_content)
+        raw = json.loads(raw_content)
 
-        # Run our Python-side sanity pass
-        result = postprocess_damage_result(raw_result)
+        # Defaults + sanity
+        raw.setdefault("severity", "Moderate")
+        raw.setdefault("damage_areas", [])
+        raw.setdefault("damage_types", [])
+        raw.setdefault("recommended_repairs", [])
+        raw.setdefault("min_cost", 600)
+        raw.setdefault("max_cost", 1500)
+        raw.setdefault("confidence", 0.7)
+        raw.setdefault("vin_used", bool(vin))
+        raw.setdefault("impact_location", "multi_zone")
+        raw.setdefault("impact_type", "unspecified impact")
+        raw.setdefault(
+            "customer_summary",
+            "Based on the photos, we estimate moderate damage. "
+            "A detailed in-person inspection may adjust the final cost.",
+        )
+
+        # Final Python-level post-processing + cost calibration
+        result = postprocess_cost_and_panels(
+            raw=raw,
+            vin=vin,
+            image_count=len(usable_urls),
+        )
+
         return result
 
     except Exception as e:
@@ -622,10 +786,11 @@ Think slowly, like a professional estimator, then output ONLY the JSON.
             "max_cost": 1500,
             "confidence": 0.5,
             "vin_used": bool(vin),
+            "impact_location": "multi_zone",
+            "impact_type": "unspecified impact",
             "customer_summary": (
                 "We had trouble analyzing the photos, but this looks like "
-                "moderate damage. A technician will confirm final pricing "
-                "after an in-person inspection."
+                "moderate damage. A technician will confirm in person."
             ),
         }
 
@@ -673,7 +838,7 @@ def require_admin(request: Request):
 def get_appointment_slots(n: int = 3) -> List[datetime.datetime]:
     now = datetime.datetime.now()
     tomorrow = now + datetime.timedelta(days=1)
-    hours = [9, 11, 14, 16]
+    hours = [9, 11, 14]
 
     slots: List[datetime.datetime] = []
     for h in hours:
@@ -745,9 +910,11 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
         max_cost = result["max_cost"]
         cost_range = f"${min_cost:,.0f} – ${max_cost:,.0f}"
 
-        areas = ", ".join(result.get("damage_areas", [])) or "visible panels identified"
-        types = ", ".join(result.get("damage_types", [])) or "detailed damage types identified"
+        areas = ", ".join(result["damage_areas"]) or "No specific damaged panels clearly detected"
+        types = ", ".join(result["damage_types"]) or "No specific damage types clearly detected"
         summary = result.get("customer_summary") or ""
+        impact_location = result.get("impact_location", "multi_zone")
+        impact_type = result.get("impact_type", "").strip()
 
         slots = get_appointment_slots()
         SESSIONS[session_key] = {"awaiting_time": True, "slots": slots}
@@ -760,6 +927,9 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
             f"Areas: {areas}",
             f"Damage Types: {types}",
         ]
+
+        if impact_type:
+            lines.append(f"Impact: {impact_type} ({impact_location})")
 
         if summary:
             lines.append("")
@@ -781,8 +951,7 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
         f"Thanks for messaging {shop.name}.",
         "",
         "To get an AI-powered pre-estimate:",
-        "- Send 1–5 clear photos of the damage",
-        "- Try to show the whole damaged area and nearby panels",
+        "- Send 1–5 clear photos of the damage (different angles if possible)",
         "- Optional: include your 17-character VIN in the text",
     ]
 
