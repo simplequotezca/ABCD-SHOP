@@ -11,7 +11,9 @@ from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 
-# ------------- FastAPI / OpenAI setup -------------
+# ============================================================
+# FastAPI + OpenAI setup
+# ============================================================
 
 app = FastAPI()
 
@@ -21,8 +23,10 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# ============================================================
+# Shop config (multi-shop via SHOPS_JSON + ?token=...)
+# ============================================================
 
-# ------------- Shop config (from SHOPS_JSON) -------------
 
 class Shop(BaseModel):
     id: str
@@ -33,6 +37,7 @@ class Shop(BaseModel):
 def load_shops_from_env() -> Dict[str, Shop]:
     raw = os.getenv("SHOPS_JSON")
     if not raw:
+        # You can make this a hard error if you prefer
         raise RuntimeError("SHOPS_JSON environment variable is required")
 
     try:
@@ -49,12 +54,13 @@ def load_shops_from_env() -> Dict[str, Shop]:
 
 SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops_from_env()
 
-
-# ------------- In-memory state for 2-step flow -------------
+# ============================================================
+# In-memory state: pending pre-scans (2-step flow)
+# ============================================================
 
 # Key = f"{shop_id}:{from_number}"
 PENDING_PRE_SCANS: Dict[str, Dict[str, Any]] = {}
-PRE_SCAN_TTL_MINUTES = 60  # how long a pre-scan is valid
+PRE_SCAN_TTL_MINUTES = 60  # pre-scan valid for 1 hour
 
 
 def conversation_key(shop_id: str, from_number: str) -> str:
@@ -62,20 +68,20 @@ def conversation_key(shop_id: str, from_number: str) -> str:
 
 
 def cleanup_expired_pre_scans() -> None:
-    """Remove old pre-scans so memory doesn't grow forever."""
     now = datetime.utcnow()
     expired_keys: List[str] = []
     for key, value in PENDING_PRE_SCANS.items():
-        created_at: datetime = value.get("created_at")  # type: ignore
+        created_at = value.get("created_at")
         if isinstance(created_at, datetime):
             if now - created_at > timedelta(minutes=PRE_SCAN_TTL_MINUTES):
                 expired_keys.append(key)
-
     for key in expired_keys:
         PENDING_PRE_SCANS.pop(key, None)
 
 
-# ------------- Shared damage vocabulary -------------
+# ============================================================
+# Damage vocabulary (strict – to reduce hallucinations)
+# ============================================================
 
 ALLOWED_AREAS = [
     # Front
@@ -101,7 +107,7 @@ ALLOWED_AREAS = [
     "rear windshield",
     "rear left taillight",
     "rear right taillight",
-    # Roof & sides
+    # Roof & side
     "roof",
     "roof rail / pillar",
     "left rear door",
@@ -138,18 +144,22 @@ ALLOWED_DAMAGE_TYPES = [
     "bent wheel",
 ]
 
+# ============================================================
+# Helpers: safe JSON parsing
+# ============================================================
 
-# ------------- Helpers for OpenAI JSON parsing -------------
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
-    """Try hard to parse a JSON object out of the model response."""
+    """
+    Try to parse JSON from a model response.
+    If it fails, try to extract a {...} block.
+    """
     text = text.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to extract a {...} block
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if match:
         try:
@@ -157,22 +167,29 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: empty structure
     return {}
 
 
-# ------------- Step 1: Vision pre-scan (areas only) -------------
+# ============================================================
+# STEP 1: Vision PRE-SCAN (areas only, no prices)
+# ============================================================
 
-def call_pre_scan_model(image_url: str) -> Dict[str, Any]:
+
+def call_pre_scan_model(image_urls: List[str]) -> Dict[str, Any]:
     """
-    Ask the vision model ONLY for clearly visible areas + damage types.
+    Ask the vision model ONLY for:
+      - which panels/areas appear clearly damaged
+      - simple damage types
+      - rough side of the vehicle
+
     No prices, no guessing, must stick to ALLOWED_AREAS / ALLOWED_DAMAGE_TYPES.
+    Uses all provided images together (1–3).
     """
     system_prompt = f"""
 You are an auto body damage PRE-SCAN assistant.
 
 Your ONLY job:
-- Look at the photo of a vehicle.
+- Look at the photo(s) of a vehicle.
 - List which panels/areas appear clearly damaged.
 - List simple damage types.
 - DO NOT estimate cost.
@@ -203,30 +220,38 @@ Respond with JSON ONLY in this exact schema:
 }}
 """
 
-    user_content = [
+    # Build multimodal content: text + all images
+    content = [
         {
             "type": "text",
-            "text": "Analyze this photo for VISIBLE vehicle damage only, following the JSON schema.",
-        },
-        {
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        },
+            "text": "Analyze these photo(s) ONLY for clearly visible exterior damage. "
+                    "Return the JSON structure exactly as described.",
+        }
     ]
+
+    # Use up to 3 images (to keep latency and cost reasonable)
+    usable = image_urls[:3]
+    for url in usable:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+        )
 
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": content},
         ],
     )
 
     raw = completion.choices[0].message.content or ""
     data = safe_json_loads(raw)
 
-    # Normalise + hard-filter against allowed vocab
     areas = [a for a in data.get("areas", []) if a in ALLOWED_AREAS]
     damage_types = [d for d in data.get("damage_types", []) if d in ALLOWED_DAMAGE_TYPES]
 
@@ -292,12 +317,15 @@ def build_pre_scan_sms(shop: Shop, pre_scan: Dict[str, Any]) -> str:
     return header + "\n\n" + "\n".join(body_lines + confirm_lines)
 
 
-# ------------- Step 2: Cost estimate from pre-scan -------------
+# ============================================================
+# STEP 2: Cost estimate from pre-scan (no new areas allowed)
+# ============================================================
+
 
 def call_estimate_model(pre_scan: Dict[str, Any], extra_info: str = "") -> Dict[str, Any]:
     """
     Take the pre-scan JSON and (optionally) extra text info (VIN, notes)
-    and produce a severity + Ontario 2025 cost band.
+    and produce severity + Ontario 2025 cost band.
     """
     system_prompt = """
 You are an experienced auto body estimator in Ontario, Canada, using realistic 2025 prices.
@@ -307,15 +335,16 @@ Input:
 - Optional short text from the customer.
 
 Your goals:
-- Classify severity as "minor", "moderate", or "severe".
-- Produce a conservative but realistic **labour + materials** cost range in CAD dollars.
-- Keep it as a **ballpark estimate**, not a guarantee.
+- Classify severity as "minor", "moderate", or "severe" (or "unknown").
+- Produce a conservative but realistic labour + materials cost range in CAD dollars.
+- Keep it as a ballpark estimate, not a guarantee.
 
 Rules:
 1. NEVER invent damage to areas that are not in the pre-scan areas list.
-2. If the pre-scan areas list is empty, say severity "unknown" and keep costs very low (e.g. 0–200) or recommend in-person inspection.
+2. If the pre-scan areas list is empty, say severity "unknown" and keep costs very low
+   (e.g. 0–200) or recommend in-person inspection.
 3. Consider that major structural or multiple-panel damage can be much higher.
-4. Output only JSON with this schema:
+4. Output only JSON with this exact schema:
 
 {
   "severity": "minor" | "moderate" | "severe" | "unknown",
@@ -326,7 +355,7 @@ Rules:
 }
 """
 
-    user_text = {
+    user_payload = {
         "pre_scan_json": pre_scan,
         "extra_info": extra_info or "",
         "region": "Ontario",
@@ -336,6 +365,7 @@ Rules:
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
             {
@@ -343,7 +373,7 @@ Rules:
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(user_text),
+                        "text": json.dumps(user_payload),
                     }
                 ],
             },
@@ -404,31 +434,29 @@ def sanity_adjust_estimate(estimate: Dict[str, Any], pre_scan: Dict[str, Any]) -
     tire_like = [a for a in areas if "tire" in a]
     non_wheel_panels = [a for a in areas if a not in wheel_like + tire_like]
 
-    # --- Special case: rim / wheel only jobs ---
+    # Special case: rim / wheel only jobs
     if non_wheel_panels == [] and (wheel_like or tire_like):
-        # Light curb rash-type jobs
         serious_wheel = any(
             key in " ".join(damage_types)
             for key in ["bent wheel", "crack", "deep dent", "hole", "puncture"]
         )
         if serious_wheel:
-            # Straightening / replacement
+            # Straightening or replacement
             min_cost = max(min_cost, 250)
             max_cost = max(max_cost, 600)
         else:
             # Simple curb rash refinish
             min_cost = 120
             max_cost = 450
-        severity = "minor" if not serious_wheel else "moderate"
+        severity = "moderate" if serious_wheel else "minor"
 
-    # --- General severity guardrails ---
+    # General severity guardrails
     if severity == "minor":
         if min_cost <= 0:
             min_cost = 150
         if max_cost <= 0 or max_cost < min_cost:
             max_cost = min_cost + 600
-        # Hard cap for minor
-        max_cost = min(max_cost, 2000)
+        max_cost = min(max_cost, 2000)  # cap minor jobs
 
     elif severity == "moderate":
         if min_cost <= 0:
@@ -449,7 +477,7 @@ def sanity_adjust_estimate(estimate: Dict[str, Any], pre_scan: Dict[str, Any]) -
     if max_cost < min_cost:
         max_cost = min_cost
 
-    # Round to nearest $10 for nice SMS
+    # Round to nearest $10
     min_cost = int(round(min_cost / 10.0)) * 10
     max_cost = int(round(max_cost / 10.0)) * 10
 
@@ -467,7 +495,9 @@ def build_estimate_sms(shop: Shop, pre_scan: Dict[str, Any], estimate: Dict[str,
     min_cost = int(estimate.get("min_cost", 0) or 0)
     max_cost = int(estimate.get("max_cost", 0) or 0)
     summary = estimate.get("summary") or ""
-    disclaimer = estimate.get("disclaimer") or "This is a visual estimate only. Final pricing may change after in-person inspection."
+    disclaimer = estimate.get("disclaimer") or (
+        "This is a visual estimate only. Final pricing may change after in-person inspection."
+    )
 
     estimate_id = str(uuid.uuid4())
 
@@ -481,31 +511,41 @@ def build_estimate_sms(shop: Shop, pre_scan: Dict[str, Any], estimate: Dict[str,
         f"Estimated Cost (Ontario 2025): ${min_cost:,} – ${max_cost:,}",
         f"Areas: {areas_str}",
         f"Damage Types: {dmg_str}",
-        "",
-        summary,
-        "",
-        f"Estimate ID (internal): {estimate_id}",
-        "",
-        disclaimer,
     ]
+
+    if summary:
+        lines.append("")
+        lines.append(summary)
+
+    lines.append("")
+    lines.append(f"Estimate ID (internal): {estimate_id}")
+    lines.append("")
+    lines.append(disclaimer)
 
     return "\n".join(lines)
 
 
-# ------------- FastAPI Twilio webhook -------------
+# ============================================================
+# Twilio webhook
+# ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request, token: str):
     """
-    Twilio will POST here:
-    https://web-production-a1388.up.railway.app/sms-webhook?token=WEBHOOK_TOKEN
-    """
+    Twilio sends SMS/MMS here:
+    https://your-domain/sms-webhook?token=SHOP_WEBHOOK_TOKEN
 
+    Flow (Option A):
+
+    1) Customer sends photo(s) -> we run PRE-SCAN and ask "Reply 1 or 2".
+    2) Customer replies 1 -> we run full estimate and reply with cost.
+    3) Customer replies 2 -> we reset and ask them to resend clearer photos.
+    """
     # Match shop by token
     shop = SHOPS_BY_TOKEN.get(token)
+    resp = MessagingResponse()
+
     if not shop:
-        # Respond nicely so Twilio doesn't keep retrying
-        resp = MessagingResponse()
         resp.message("Invalid shop configuration. Please contact the shop directly.")
         return Response(content=str(resp), media_type="application/xml")
 
@@ -522,20 +562,25 @@ async def sms_webhook(request: Request, token: str):
     cleanup_expired_pre_scans()
     key = conversation_key(shop.id, from_number)
 
-    resp = MessagingResponse()
-
-    # --- CASE 1: Incoming photo(s) => run PRE-SCAN ---
+    # --------------------------------------------------------
+    # CASE 1: Incoming photos -> run PRE-SCAN automatically
+    # --------------------------------------------------------
     if num_media > 0:
-        image_url = form.get("MediaUrl0")
-        if not image_url:
+        # Collect all image URLs from this message
+        image_urls: List[str] = []
+        for i in range(num_media):
+            url = form.get(f"MediaUrl{i}")
+            if url:
+                image_urls.append(url)
+
+        if not image_urls:
             resp.message(
                 "I couldn't read the photo. Please try again and make sure at least one image is attached."
             )
             return Response(content=str(resp), media_type="application/xml")
 
-        pre_scan = call_pre_scan_model(image_url)
+        pre_scan = call_pre_scan_model(image_urls)
 
-        # Store for step 2
         PENDING_PRE_SCANS[key] = {
             "shop_id": shop.id,
             "from_number": from_number,
@@ -547,8 +592,9 @@ async def sms_webhook(request: Request, token: str):
         resp.message(sms_text)
         return Response(content=str(resp), media_type="application/xml")
 
-    # --- CASE 2: No photo, but user replies "1" (confirm) or "2" (reject) ---
-
+    # --------------------------------------------------------
+    # CASE 2: No photos, but user replies "1" (confirm) or "2" (reject)
+    # --------------------------------------------------------
     lower_body = body.lower()
 
     if lower_body in {"1", "yes", "y"}:
@@ -564,14 +610,11 @@ async def sms_webhook(request: Request, token: str):
         estimate = call_estimate_model(pre_scan, extra_info="")
         sms_text = build_estimate_sms(shop, pre_scan, estimate)
 
-        # Clear state now that we've completed the estimate
         PENDING_PRE_SCANS.pop(key, None)
-
         resp.message(sms_text)
         return Response(content=str(resp), media_type="application/xml")
 
     if lower_body in {"2", "no", "n"}:
-        # User says pre-scan was wrong
         PENDING_PRE_SCANS.pop(key, None)
         resp.message(
             "No problem. Please send 2–3 clearer photos of the damage "
@@ -579,13 +622,14 @@ async def sms_webhook(request: Request, token: str):
         )
         return Response(content=str(resp), media_type="application/xml")
 
-    # --- CASE 3: No media, no 1/2 => general instructions / fallback ---
-
+    # --------------------------------------------------------
+    # CASE 3: No media & no 1/2 -> send instructions
+    # --------------------------------------------------------
     instructions = (
         f"Thanks for contacting {shop.name}.\n\n"
         "To get an AI damage estimate:\n"
         "1) Send 2–3 clear photos of the damaged area (different angles).\n"
-        "2) I'll first send you a PRE-SCAN listing which panels look damaged.\n"
+        "2) I'll first send a PRE-SCAN listing which panels look damaged.\n"
         "3) Reply 1 to confirm, or 2 if it's wrong and you'll resend photos.\n"
         "4) After you confirm, I'll send a detailed Ontario 2025 cost estimate.\n"
     )
@@ -593,7 +637,9 @@ async def sms_webhook(request: Request, token: str):
     return Response(content=str(resp), media_type="application/xml")
 
 
-# ------------- Simple health check -------------
+# ============================================================
+# Health check
+# ============================================================
 
 @app.get("/")
 async def root():
