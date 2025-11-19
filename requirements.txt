@@ -1,9 +1,8 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-python-multipart
-httpx
-twilio
-psycopg2-binary
-python-dotenv
+fastapi==0.110.0
+uvicorn==0.29.0
+python-multipart==0.0.6
+openai==1.17.0
+pydantic==2.7.0
+pydantic_settings==2.3.2
+Pillow==10.2.0
+requests==2.31.0
