@@ -1,17 +1,17 @@
 import os
 import json
 import re
-import uuid
 import base64
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
+import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, PlainTextResponse
 from pydantic import BaseModel
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
-import httpx
 
 # ============================================================
 # FastAPI + OpenAI setup
@@ -25,23 +25,28 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Twilio creds for authenticated media download
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-
 # ============================================================
-# Multi-shop config via SHOPS_JSON
+# Multi-shop config (tokenized routing via SHOPS_JSON)
 # ============================================================
 
 class Shop(BaseModel):
     id: str
     name: str
-    webhook_token: str
+    webhook_token: str  # used as ?token=... in Twilio URL
 
 
 def load_shops() -> Dict[str, Shop]:
+    """
+    SHOPS_JSON example (Railway env var):
+
+    [
+      {"id": "mississauga", "name": "Mississauga Collision Centre", "webhook_token": "shop_miss_123"},
+      {"id": "brampton", "name": "Brampton Auto Body", "webhook_token": "shop_bramp_456"}
+    ]
+    """
     raw = os.getenv("SHOPS_JSON")
     if not raw:
+        # Safe default so local testing still works
         default = Shop(
             id="default",
             name="Auto Body Shop",
@@ -57,12 +62,13 @@ def load_shops() -> Dict[str, Shop]:
     return by_token
 
 
-SHOPS_BY_TOKEN = load_shops()
+SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
 
 # ============================================================
-# In-memory session store
+# In-memory session store (shop + phone -> pre-scan result)
 # ============================================================
 
+# Key: f"{shop.id}:{phone}"
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_TTL_MINUTES = 60
 
@@ -73,18 +79,17 @@ def session_key(shop: Shop, phone: str) -> str:
 
 def cleanup_sessions() -> None:
     now = datetime.utcnow()
-    expired: List[str] = []
-    for key, data in SESSIONS.items():
-        created = data.get("created_at")
-        if isinstance(created, datetime) and now - created > timedelta(
-            minutes=SESSION_TTL_MINUTES
-        ):
-            expired.append(key)
-    for k in expired:
+    to_delete: List[str] = []
+    for key, val in SESSIONS.items():
+        created_at = val.get("created_at")
+        if isinstance(created_at, datetime):
+            if now - created_at > timedelta(minutes=SESSION_TTL_MINUTES):
+                to_delete.append(key)
+    for k in to_delete:
         SESSIONS.pop(k, None)
 
 # ============================================================
-# Allowed vocabulary (keeps AI predictable)
+# Strict vocab – prevent hallucinated panels / damage
 # ============================================================
 
 ALLOWED_AREAS = [
@@ -130,12 +135,27 @@ ALLOWED_DAMAGE_TYPES = [
 
 def clean_areas_from_text(text: str) -> List[str]:
     t = text.lower()
-    return list(dict.fromkeys([a for a in ALLOWED_AREAS if a in t]))
+    found = [a for a in ALLOWED_AREAS if a in t]
+    # dedupe, preserve order
+    seen = set()
+    result = []
+    for a in found:
+        if a not in seen:
+            seen.add(a)
+            result.append(a)
+    return result
 
 
 def clean_damage_types_from_text(text: str) -> List[str]:
     t = text.lower()
-    return list(dict.fromkeys([d for d in ALLOWED_DAMAGE_TYPES if d in t]))
+    found = [d for d in ALLOWED_DAMAGE_TYPES if d in t]
+    seen = set()
+    result = []
+    for d in found:
+        if d not in seen:
+            seen.add(d)
+            result.append(d)
+    return result
 
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
@@ -153,7 +173,35 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     return {}
 
 # ============================================================
-# PRE-SCAN (Areas + basic damage)
+# Twilio media download helpers
+# ============================================================
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+
+def download_twilio_media(url: str) -> bytes:
+    """
+    Download a single Twilio media URL using basic auth.
+    Raises on any non-200 or network error.
+    """
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        raise RuntimeError("Twilio credentials are not configured")
+
+    resp = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=20)
+    resp.raise_for_status()
+    return resp.content
+
+
+def bytes_to_data_url(data: bytes, content_type: str = "image/jpeg") -> str:
+    """
+    Convert raw bytes to a data: URL so OpenAI never has to call Twilio.
+    """
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{content_type};base64,{b64}"
+
+# ============================================================
+# STEP 1 – PRE-SCAN (areas & basic damage only)
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
@@ -162,11 +210,13 @@ You are an automotive DAMAGE PRE-SCAN AI.
 Your job:
 - Look at the image(s) of a vehicle.
 - Identify ONLY the panels/areas that clearly show visible damage.
-- Identify ONLY basic damage types.
-- Do NOT guess. Keep it short.
-- No cost estimates.
+- Identify ONLY basic damage types (scratches, dents, scuffs, cracks, curb rash, etc).
+- DO NOT estimate cost.
+- DO NOT guess.
+- DO NOT mention areas that are not clearly damaged.
+- If you are unsure, keep the list short and say that in the notes.
 
-Format:
+Use natural language, not JSON. Use this format:
 
 AREAS:
 - area 1
@@ -177,21 +227,18 @@ DAMAGE TYPES:
 - type 2
 
 NOTES:
-- any uncertainty
+- short comment about what you see / any uncertainty
 """.strip()
 
 
 def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     """
-    image_data_urls: list of data: URLs (base64-encoded images)
+    Run OpenAI multi-modal pre-scan on 1–3 images.
+    image_data_urls must be data: URLs (already downloaded from Twilio).
+    Returns: { areas: [...], damage_types: [...], notes: "..." }
     """
     if not image_data_urls:
-        return {
-            "areas": [],
-            "damage_types": [],
-            "notes": "No usable images were available.",
-            "raw": "",
-        }
+        return {"areas": [], "damage_types": [], "notes": "No images received."}
 
     content: List[dict] = [
         {
@@ -203,8 +250,8 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
         }
     ]
 
-    for data_url in image_data_urls[:3]:
-        content.append({"type": "image_url", "image_url": {"url": data_url}})
+    for url in image_data_urls[:3]:
+        content.append({"type": "image_url", "image_url": {"url": url}})
 
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -217,85 +264,94 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
 
     raw = completion.choices[0].message.content or ""
     areas = clean_areas_from_text(raw)
-    types = clean_damage_types_from_text(raw)
+    damage_types = clean_damage_types_from_text(raw)
 
+    # Try to pull NOTES: line if present, but it's optional
     notes = ""
-    m = re.search(r"NOTES:\s*(.+)", raw, flags=re.DOTALL | re.IGNORECASE)
+    m = re.search(r"NOTES:\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
     if m:
         notes = m.group(1).strip()
 
     return {
         "areas": areas,
-        "damage_types": types,
+        "damage_types": damage_types,
         "notes": notes,
         "raw": raw,
     }
 
 
-def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any]) -> str:
-    lines = [f"AI Pre-Scan for {shop.name}", ""]
+def build_pre_scan_sms(shop: Shop, pre_scan: Dict[str, Any]) -> str:
+    areas = pre_scan.get("areas", [])
+    damage_types = pre_scan.get("damage_types", [])
+    notes = pre_scan.get("notes", "") or ""
 
-    if pre["areas"]:
-        lines.append("Here's what I can clearly see:")
-        for a in pre["areas"]:
+    lines: List[str] = [f"AI Pre-Scan for {shop.name}", ""]
+
+    if areas:
+        lines.append("Here's what I can clearly see from your photo(s):")
+        for a in areas:
             lines.append(f"- {a}")
     else:
-        lines.append("I couldn't confidently see specific damaged panels yet.")
+        lines.append(
+            "I couldn't confidently pick out specific damaged panels yet from this angle."
+        )
 
-    if pre["damage_types"]:
+    if damage_types:
         lines.append("")
-        lines.append("Damage types:")
-        lines.append("- " + ", ".join(pre["damage_types"]))
+        lines.append("Damage types I can see:")
+        lines.append("- " + ", ".join(damage_types))
 
-    if pre.get("notes"):
+    if notes:
         lines.append("")
         lines.append("Notes:")
-        lines.append(pre["notes"])
+        lines.append(notes)
 
     lines.append("")
-    lines.append("If this looks right, reply 1.")
-    lines.append("If it's off, reply 2 and send 1–3 clearer photos.")
+    lines.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
+    lines.append("If it's off, reply 2 and you can send clearer / wider photos.")
 
     return "\n".join(lines)
 
 # ============================================================
-# FULL ESTIMATE
+# STEP 2 – FULL ESTIMATE (severity + cost, Ontario 2025)
 # ============================================================
 
 ESTIMATE_SYSTEM_PROMPT = """
-You are an experienced collision estimator in Ontario, Canada (2025).
+You are an experienced collision estimator in Ontario, Canada (year 2025).
 
-You will receive:
-- confirmed damaged areas
-- damage types
+You receive:
+- A list of CONFIRMED damaged areas.
+- A list of basic damage types.
 
-Tasks:
-1) Classify severity (minor, moderate, severe, unknown)
-2) Provide CAD cost range
-3) Provide a 2–4 sentence explanation
-4) Provide a disclaimer
+Your tasks:
+1) Classify severity: "minor", "moderate", or "severe" (or "unknown" if impossible).
+2) Provide a realistic repair cost range in CAD (min_cost, max_cost) for labour + materials.
+3) Write a short, customer-friendly explanation (2–4 sentences).
+4) Keep it clearly a visual, preliminary estimate (not a final bill).
 
-STRICT:
-- Never add new areas.
+STRICT RULE:
+- NEVER add new panels or areas beyond those given.
+- If the confirmed areas list is empty, set severity to "unknown" and keep cost very low or 0–200.
 
-Return ONLY JSON:
+Output JSON ONLY in this exact schema:
+
 {
-  "severity": "...",
+  "severity": "minor | moderate | severe | unknown",
   "min_cost": 0,
   "max_cost": 0,
-  "summary": "",
-  "disclaimer": ""
+  "summary": "2–4 sentence explanation.",
+  "disclaimer": "Short note reminding it's a visual estimate only."
 }
 """.strip()
 
 
-def run_estimate(shop: Shop, areas: List[str], dmg_types: List[str]) -> Dict[str, Any]:
+def run_estimate(shop: Shop, areas: List[str], damage_types: List[str]) -> Dict[str, Any]:
     payload = {
         "shop_name": shop.name,
         "region": "Ontario",
         "year": 2025,
         "confirmed_areas": areas,
-        "damage_types": dmg_types,
+        "damage_types": damage_types,
     }
 
     completion = client.chat.completions.create(
@@ -304,7 +360,15 @@ def run_estimate(shop: Shop, areas: List[str], dmg_types: List[str]) -> Dict[str
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload)}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(payload),
+                    }
+                ],
+            },
         ],
     )
 
@@ -316,16 +380,19 @@ def run_estimate(shop: Shop, areas: List[str], dmg_types: List[str]) -> Dict[str
         severity = "unknown"
 
     try:
-        min_cost = float(data.get("min_cost") or 0)
-        max_cost = float(data.get("max_cost") or 0)
-    except Exception:
-        min_cost, max_cost = 0, 0
+        min_cost = float(data.get("min_cost", 0) or 0)
+    except (TypeError, ValueError):
+        min_cost = 0.0
+
+    try:
+        max_cost = float(data.get("max_cost", 0) or 0)
+    except (TypeError, ValueError):
+        max_cost = 0.0
 
     summary = str(data.get("summary", "")).strip()
-    disclaimer = str(data.get("disclaimer", "")).strip() or \
-        "This is a visual pre-estimate only. Final pricing may change after in-person inspection."
+    disclaimer = str(data.get("disclaimer", "")).strip()
 
-    return {
+    estimate = {
         "severity": severity,
         "min_cost": min_cost,
         "max_cost": max_cost,
@@ -333,72 +400,137 @@ def run_estimate(shop: Shop, areas: List[str], dmg_types: List[str]) -> Dict[str
         "disclaimer": disclaimer,
     }
 
+    return sanity_adjust_estimate(estimate, areas, damage_types)
 
-def build_estimate_sms(shop: Shop, areas, dmg_types, estimate) -> str:
-    return (
-        f"AI Damage Estimate for {shop.name}\n\n"
-        f"Severity: {estimate['severity'].capitalize()}\n"
-        f"Estimated Cost (Ontario 2025): ${int(estimate['min_cost']):,} – ${int(estimate['max_cost']):,}\n"
-        f"Areas: {', '.join(areas) if areas else 'None detected'}\n"
-        f"Damage Types: {', '.join(dmg_types) if dmg_types else 'None detected'}\n\n"
-        f"{estimate['summary']}\n\n"
-        f"Estimate ID: {uuid.uuid4()}\n\n"
-        f"{estimate['disclaimer']}"
+
+def sanity_adjust_estimate(
+    estimate: Dict[str, Any],
+    areas: List[str],
+    damage_types: List[str],
+) -> Dict[str, Any]:
+    severity = estimate.get("severity", "unknown").lower()
+    try:
+        min_cost = float(estimate.get("min_cost", 0) or 0)
+    except (TypeError, ValueError):
+        min_cost = 0.0
+    try:
+        max_cost = float(estimate.get("max_cost", 0) or 0)
+    except (TypeError, ValueError):
+        max_cost = 0.0
+
+    lowered_areas = [a.lower() for a in areas]
+    lowered_types = [d.lower() for d in damage_types]
+
+    wheel_like = [a for a in lowered_areas if "wheel" in a or "rim" in a]
+    tire_like = [a for a in lowered_areas if "tire" in a]
+    non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
+
+    # Wheel-only jobs: clamp to realistic cosmetic / bent wheel numbers
+    if non_wheel_panels == [] and (wheel_like or tire_like):
+        serious = any(
+            key in " ".join(lowered_types)
+            for key in ["bent wheel", "crack", "deep dent", "hole", "puncture"]
+        )
+        if serious:
+            min_cost = max(min_cost, 250)
+            max_cost = max(max_cost, 700)
+            severity = "moderate"
+        else:
+            min_cost = max(min_cost, 120)
+            max_cost = max(max_cost, 450)
+            severity = "minor"
+
+    # General guardrails
+    if severity == "minor":
+        if min_cost <= 0:
+            min_cost = 150
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 600
+        max_cost = min(max_cost, 2000)
+    elif severity == "moderate":
+        if min_cost <= 0:
+            min_cost = 600
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 2500
+    elif severity == "severe":
+        if min_cost <= 0:
+            min_cost = 2000
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 6000
+    else:  # unknown
+        if min_cost <= 0 and max_cost <= 0:
+            min_cost, max_cost = 0, 200
+
+    if max_cost < min_cost:
+        max_cost = min_cost
+
+    # Round to nearest $10
+    min_cost = int(round(min_cost / 10.0)) * 10
+    max_cost = int(round(max_cost / 10.0)) * 10
+
+    estimate["severity"] = severity
+    estimate["min_cost"] = min_cost
+    estimate["max_cost"] = max_cost
+    return estimate
+
+
+def build_estimate_sms(shop: Shop, areas: List[str], damage_types: List[str], estimate: Dict[str, Any]) -> str:
+    severity = estimate.get("severity", "unknown").capitalize()
+    min_cost = int(estimate.get("min_cost", 0) or 0)
+    max_cost = int(estimate.get("max_cost", 0) or 0)
+    summary = estimate.get("summary") or ""
+    disclaimer = estimate.get("disclaimer") or (
+        "This is a visual pre-estimate only. Final pricing may change after in-person inspection."
     )
 
-# ============================================================
-# Twilio media download → base64 data URLs
-# ============================================================
+    estimate_id = str(uuid.uuid4())
 
-async def fetch_twilio_media_data_urls(form, num_media: int) -> List[str]:
-    """
-    Download MMS media from Twilio with auth and return as data: URLs.
-    """
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-        return []
+    areas_str = ", ".join(areas) if areas else "not clearly identified yet"
+    dmg_str = ", ".join(damage_types) if damage_types else "not clearly classified yet"
 
-    data_urls: List[str] = []
+    lines: List[str] = [
+        f"AI Damage Estimate for {shop.name}",
+        "",
+        f"Severity: {severity}",
+        f"Estimated Cost (Ontario 2025): ${min_cost:,} – ${max_cost:,}",
+        f"Areas: {areas_str}",
+        f"Damage Types: {dmg_str}",
+    ]
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for i in range(num_media):
-            media_url = form.get(f"MediaUrl{i}")
-            if not media_url:
-                continue
+    if summary:
+        lines.append("")
+        lines.append(summary)
 
-            try:
-                resp = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-                if resp.status_code != 200:
-                    continue
+    lines.append("")
+    lines.append(f"Estimate ID (internal): {estimate_id}")
+    lines.append("")
+    lines.append(disclaimer)
 
-                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-                b64 = base64.b64encode(resp.content).decode("ascii")
-                data_url = f"data:{content_type};base64,{b64}"
-                data_urls.append(data_url)
-            except Exception:
-                # Skip any failed image but continue with the rest
-                continue
-
-    return data_urls
+    return "\n".join(lines)
 
 # ============================================================
-# Twilio Webhook (production-grade)
+# Twilio webhook: multi-shop + 2-step flow (with XML replies)
 # ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
+    """
+    Twilio hits:
+    https://YOUR-RAILWAY-DOMAIN/sms-webhook?token=SHOP_WEBHOOK_TOKEN
+    """
     token = request.query_params.get("token")
     shop = SHOPS_BY_TOKEN.get(token) if token else None
+
     reply = MessagingResponse()
 
     if not shop:
-        reply.message("This number is not configured correctly. Please contact the shop directly.")
-        return Response(str(reply), media_type="application/xml")
+        reply.message("This number is not configured correctly. Please contact the body shop directly.")
+        return Response(content=str(reply), media_type="application/xml")
 
     try:
         form = await request.form()
         body = (form.get("Body") or "").strip()
         from_number = form.get("From", "")
-        lower = body.lower()
         num_media_str = form.get("NumMedia", "0") or "0"
 
         try:
@@ -408,68 +540,98 @@ async def sms_webhook(request: Request):
 
         cleanup_sessions()
         key = session_key(shop, from_number)
+        lower_body = body.lower()
 
-        # ----------------------------------------------------
-        # CASE 1 — MEDIA RECEIVED → download & PRE-SCAN
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # CASE 1 — MMS received → download from Twilio → PRE-SCAN
+        # --------------------------------------------------------
         if num_media > 0:
-            image_data_urls = await fetch_twilio_media_data_urls(form, num_media)
+            image_data_urls: List[str] = []
+
+            for i in range(num_media):
+                media_url = form.get(f"MediaUrl{i}")
+                content_type = form.get(f"MediaContentType{i}") or "image/jpeg"
+
+                if not media_url:
+                    continue
+
+                try:
+                    raw = download_twilio_media(media_url)
+                except Exception:
+                    # Twilio 11200-style failures show up here
+                    reply.message(
+                        "Sorry — I couldn't download the photos from your carrier. "
+                        "Please resend 1–3 clear photos of the damaged area."
+                    )
+                    return Response(content=str(reply), media_type="application/xml")
+
+                data_url = bytes_to_data_url(raw, content_type)
+                image_data_urls.append(data_url)
 
             if not image_data_urls:
                 reply.message(
-                    "Sorry — I couldn't download the photos from your carrier. "
+                    "Sorry — I had trouble reading the photos. "
                     "Please resend 1–3 clear photos of the damaged area."
                 )
-                return Response(str(reply), media_type="application/xml")
+            else:
+                try:
+                    pre_scan = run_pre_scan(image_data_urls, shop)
+                except Exception:
+                    reply.message(
+                        "Sorry — I couldn't process the photos. "
+                        "Please try sending them again."
+                    )
+                    return Response(content=str(reply), media_type="application/xml")
 
-            try:
-                pre = run_pre_scan(image_data_urls, shop)
-            except Exception:
-                reply.message(
-                    "Sorry — I had trouble processing the photos. "
-                    "Please try again with 1–3 clear photos of the damage."
-                )
-                return Response(str(reply), media_type="application/xml")
+                SESSIONS[key] = {
+                    "areas": pre_scan.get("areas", []),
+                    "damage_types": pre_scan.get("damage_types", []),
+                    "created_at": datetime.utcnow(),
+                }
 
-            SESSIONS[key] = {
-                "areas": pre["areas"],
-                "damage_types": pre["damage_types"],
-                "created_at": datetime.utcnow(),
-            }
+                reply.message(build_pre_scan_sms(shop, pre_scan))
 
-            reply.message(build_pre_scan_sms(shop, pre))
-            return Response(str(reply), media_type="application/xml")
+            return Response(content=str(reply), media_type="application/xml")
 
-        # ----------------------------------------------------
-        # CASE 2 — CONFIRM (1)
-        # ----------------------------------------------------
-        if lower in {"1", "yes", "y"}:
+        # --------------------------------------------------------
+        # CASE 2 — Customer replies 1 (confirm pre-scan)
+        # --------------------------------------------------------
+        if lower_body in {"1", "yes", "y"}:
             session = SESSIONS.get(key)
             if not session:
-                reply.message("I don't see recent photos. Please send 1–3 photos of the damage to start.")
-                return Response(str(reply), media_type="application/xml")
+                reply.message(
+                    "I don't see a recent photo for this number. "
+                    "Please send 1–3 clear photos of the damaged area to start a new estimate."
+                )
+                return Response(content=str(reply), media_type="application/xml")
 
             try:
                 estimate = run_estimate(shop, session["areas"], session["damage_types"])
                 text = build_estimate_sms(shop, session["areas"], session["damage_types"], estimate)
             except Exception:
-                text = "Sorry — I couldn't generate the estimate. Please resend the photos to start again."
+                text = (
+                    "Sorry — I couldn’t generate the estimate. "
+                    "Please resend the photos to start again."
+                )
 
             SESSIONS.pop(key, None)
             reply.message(text)
-            return Response(str(reply), media_type="application/xml")
+            return Response(content=str(reply), media_type="application/xml")
 
-        # ----------------------------------------------------
-        # CASE 3 — RESCAN (2)
-        # ----------------------------------------------------
-        if lower in {"2", "no", "n"}:
+        # --------------------------------------------------------
+        # CASE 3 — Customer replies 2 (pre-scan is wrong)
+        # --------------------------------------------------------
+        if lower_body in {"2", "no", "n"}:
             SESSIONS.pop(key, None)
-            reply.message("No problem. Please send 1–3 clearer photos of the damaged area.")
-            return Response(str(reply), media_type="application/xml")
+            reply.message(
+                "No problem. Please send 1–3 clearer photos of the damaged area "
+                "(include a wide shot plus a couple close-ups) and I'll rescan it."
+            )
+            return Response(content=str(reply), media_type="application/xml")
 
-        # ----------------------------------------------------
-        # DEFAULT: Instructions
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # CASE 4 — Default instructions (no media, no 1/2)
+        # --------------------------------------------------------
         instructions = (
             f"Hi from {shop.name}!\n\n"
             "To get an AI-powered damage estimate:\n"
@@ -481,35 +643,39 @@ async def sms_webhook(request: Request):
         )
 
         reply.message(instructions)
-        return Response(str(reply), media_type="application/xml")
+        return Response(content=str(reply), media_type="application/xml")
 
     except Exception:
         reply.message("Unexpected error. Please send the photos again.")
-        return Response(str(reply), media_type="application/xml")
+        return Response(content=str(reply), media_type="application/xml")
 
 # ============================================================
-# Admin helper
+# Admin helper: see shops & webhook URLs
 # ============================================================
 
 @app.get("/admin/shops")
 async def list_shops():
-    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-    items = []
+    """
+    Simple JSON view to confirm SHOPS_JSON + webhook URLs.
+    (You can protect this behind an admin key later if needed.)
+    """
+    base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    result = []
     for shop in SHOPS_BY_TOKEN.values():
         webhook = (
-            f"{base}/sms-webhook?token={shop.webhook_token}"
-            if base
+            f"{base_url}/sms-webhook?token={shop.webhook_token}"
+            if base_url
             else f"/sms-webhook?token={shop.webhook_token}"
         )
-        items.append(
+        result.append(
             {
                 "id": shop.id,
                 "name": shop.name,
                 "webhook_token": shop.webhook_token,
-                "webhook": webhook,
+                "twilio_webhook_example": webhook,
             }
         )
-    return items
+    return result
 
 # ============================================================
 # Health check
@@ -517,4 +683,4 @@ async def list_shops():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Multi-shop damage estimator running"}
+    return {"status": "ok", "message": "Multi-shop AI damage estimator is running"}
