@@ -111,6 +111,7 @@ ALLOWED_AREAS = [
     "left rear tire", "right rear tire",
 ]
 
+# Expanded to capture dents / deformation phrases
 ALLOWED_DAMAGE_TYPES = [
     "light scratch",
     "deep scratch",
@@ -118,6 +119,10 @@ ALLOWED_DAMAGE_TYPES = [
     "paint transfer",
     "small dent",
     "deep dent",
+    "dent",
+    "dented",
+    "heavy dent",
+    "heavily dented",
     "crease",
     "panel deformation",
     "bumper deformation",
@@ -130,6 +135,8 @@ ALLOWED_DAMAGE_TYPES = [
     "curb rash",
     "bent wheel",
     "misalignment",
+    "deformed",
+    "heavily deformed",
 ]
 
 
@@ -209,7 +216,8 @@ You are an automotive DAMAGE PRE-SCAN AI.
 Your job:
 - Look at the image(s) of a vehicle.
 - Identify ONLY the panels/areas that clearly show visible damage.
-- Identify ONLY basic damage types (scratches, dents, scuffs, cracks, curb rash, etc).
+- Identify ONLY basic damage types (scratches, dents, scuffs, cracks, curb rash, deformation, etc).
+- Treat crushed / heavily dented / deformed metal as "deep dent" or "panel deformation" or "bumper deformation" in DAMAGE TYPES.
 - DO NOT estimate cost.
 - DO NOT guess.
 - DO NOT mention areas that are not clearly damaged.
@@ -321,12 +329,18 @@ You are an experienced collision estimator in Ontario, Canada (year 2025).
 You receive:
 - A list of CONFIRMED damaged areas.
 - A list of basic damage types.
+- Optional notes describing the visible damage (for example: "trunk lid is heavily dented and deformed").
 
 Your tasks:
 1) Classify severity: "minor", "moderate", or "severe" (or "unknown" if impossible).
 2) Provide a realistic repair cost range in CAD (min_cost, max_cost) for labour + materials.
 3) Write a short, customer-friendly explanation (2–4 sentences).
 4) Keep it clearly a visual, preliminary estimate (not a final bill).
+
+Severity guidance:
+- Crushed, heavily dented, caved-in, or clearly deformed panels on structural areas (trunk, hood, bumpers, quarter panels, roof) are usually "moderate" or "severe", not "minor".
+- Small cosmetic scratches or scuffs on a single panel with no deformation are usually "minor".
+- Multiple damaged panels or combined deformation + cracks typically push severity to at least "moderate" or "severe".
 
 STRICT RULE:
 - NEVER add new panels or areas beyond those given.
@@ -344,13 +358,19 @@ Output JSON ONLY in this exact schema:
 """.strip()
 
 
-def run_estimate(shop: Shop, areas: List[str], damage_types: List[str]) -> Dict[str, Any]:
+def run_estimate(
+    shop: Shop,
+    areas: List[str],
+    damage_types: List[str],
+    notes: str = "",
+) -> Dict[str, Any]:
     payload = {
         "shop_name": shop.name,
         "region": "Ontario",
         "year": 2025,
         "confirmed_areas": areas,
         "damage_types": damage_types,
+        "pre_scan_notes": notes or "",
     }
 
     completion = client.chat.completions.create(
@@ -399,14 +419,16 @@ def run_estimate(shop: Shop, areas: List[str], damage_types: List[str]) -> Dict[
         "disclaimer": disclaimer,
     }
 
-    return sanity_adjust_estimate(estimate, areas, damage_types)
+    return sanity_adjust_estimate(estimate, areas, damage_types, notes)
 
 
 def sanity_adjust_estimate(
     estimate: Dict[str, Any],
     areas: List[str],
     damage_types: List[str],
+    notes: str = "",
 ) -> Dict[str, Any]:
+    # Base values from the model
     severity = estimate.get("severity", "unknown").lower()
     try:
         min_cost = float(estimate.get("min_cost", 0) or 0)
@@ -419,12 +441,15 @@ def sanity_adjust_estimate(
 
     lowered_areas = [a.lower() for a in areas]
     lowered_types = [d.lower() for d in damage_types]
+    notes_text = (notes or "").lower()
 
     wheel_like = [a for a in lowered_areas if "wheel" in a or "rim" in a]
     tire_like = [a for a in lowered_areas if "tire" in a]
     non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
 
-    # Wheel-only jobs: clamp to realistic cosmetic / bent wheel numbers
+    # ------------------------------------------------------------
+    # 1) Wheel-only jobs: clamp to realistic cosmetic / bent wheel numbers
+    # ------------------------------------------------------------
     if non_wheel_panels == [] and (wheel_like or tire_like):
         serious = any(
             key in " ".join(lowered_types)
@@ -439,7 +464,63 @@ def sanity_adjust_estimate(
             max_cost = max(max_cost, 450)
             severity = "minor"
 
-    # General guardrails
+    # ------------------------------------------------------------
+    # 2) Heavy deformation / crushed metal overrides
+    # ------------------------------------------------------------
+    severity_rank = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3}
+    rank_to_label = {v: k for k, v in severity_rank.items()}
+    current_rank = severity_rank.get(severity, 0)
+
+    heavy_terms = [
+        "heavily dented",
+        "heavy dent",
+        "deep dent",
+        "panel deformation",
+        "bumper deformation",
+        "deformed",
+        "heavily deformed",
+        "crushed",
+        "caved in",
+        "buckled",
+        "pushed in",
+        "folded",
+    ]
+
+    types_text = " ".join(lowered_types)
+    has_heavy = any(term in types_text or term in notes_text for term in heavy_terms)
+
+    structural_panels = [
+        "hood",
+        "trunk",
+        "roof",
+        "left quarter panel",
+        "right quarter panel",
+        "front bumper upper",
+        "front bumper lower",
+        "rear bumper upper",
+        "rear bumper lower",
+    ]
+    has_structural = any(p in lowered_areas for p in structural_panels)
+
+    if has_heavy and has_structural:
+        # Crushed / deformed structural panels should never be "minor"
+        current_rank = max(current_rank, severity_rank["severe"])
+    elif has_heavy:
+        current_rank = max(current_rank, severity_rank["moderate"])
+
+    # ------------------------------------------------------------
+    # 3) Multi-panel damage heuristic
+    # ------------------------------------------------------------
+    if len(non_wheel_panels) >= 3:
+        # More than 2 non-wheel panels with damage is rarely truly minor
+        current_rank = max(current_rank, severity_rank["moderate"])
+
+    # Final severity from rank
+    severity = rank_to_label.get(current_rank, severity)
+
+    # ------------------------------------------------------------
+    # 4) General guardrails on cost ranges
+    # ------------------------------------------------------------
     if severity == "minor":
         if min_cost <= 0:
             min_cost = 150
@@ -473,7 +554,12 @@ def sanity_adjust_estimate(
     return estimate
 
 
-def build_estimate_sms(shop: Shop, areas: List[str], damage_types: List[str], estimate: Dict[str, Any]) -> str:
+def build_estimate_sms(
+    shop: Shop,
+    areas: List[str],
+    damage_types: List[str],
+    estimate: Dict[str, Any],
+) -> str:
     severity = estimate.get("severity", "unknown").capitalize()
     min_cost = int(estimate.get("min_cost", 0) or 0)
     max_cost = int(estimate.get("max_cost", 0) or 0)
@@ -582,9 +668,12 @@ async def sms_webhook(request: Request):
                     )
                     return Response(content=str(reply), media_type="application/xml")
 
+                # Store full pre-scan info (including notes) for step 2
                 SESSIONS[key] = {
                     "areas": pre_scan.get("areas", []),
                     "damage_types": pre_scan.get("damage_types", []),
+                    "notes": pre_scan.get("notes", ""),
+                    "raw": pre_scan.get("raw", ""),
                     "created_at": datetime.utcnow(),
                 }
 
@@ -605,8 +694,18 @@ async def sms_webhook(request: Request):
                 return Response(content=str(reply), media_type="application/xml")
 
             try:
-                estimate = run_estimate(shop, session["areas"], session["damage_types"])
-                text = build_estimate_sms(shop, session["areas"], session["damage_types"], estimate)
+                estimate = run_estimate(
+                    shop,
+                    session.get("areas", []),
+                    session.get("damage_types", []),
+                    session.get("notes", ""),
+                )
+                text = build_estimate_sms(
+                    shop,
+                    session.get("areas", []),
+                    session.get("damage_types", []),
+                    estimate,
+                )
             except Exception:
                 text = (
                     "Sorry — I couldn’t generate the estimate. "
