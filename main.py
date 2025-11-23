@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
@@ -136,9 +136,8 @@ ALLOWED_DAMAGE_TYPES = [
 def clean_areas_from_text(text: str) -> List[str]:
     t = text.lower()
     found = [a for a in ALLOWED_AREAS if a in t]
-    # dedupe, preserve order
     seen = set()
-    result = []
+    result: List[str] = []
     for a in found:
         if a not in seen:
             seen.add(a)
@@ -150,7 +149,7 @@ def clean_damage_types_from_text(text: str) -> List[str]:
     t = text.lower()
     found = [d for d in ALLOWED_DAMAGE_TYPES if d in t]
     seen = set()
-    result = []
+    result: List[str] = []
     for d in found:
         if d not in seen:
             seen.add(d)
