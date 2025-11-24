@@ -36,17 +36,9 @@ class Shop(BaseModel):
 
 
 def load_shops() -> Dict[str, Shop]:
-    """
-    SHOPS_JSON example (Railway env var):
-
-    [
-      {"id": "mississauga", "name": "Mississauga Collision Centre", "webhook_token": "shop_miss_123"},
-      {"id": "brampton", "name": "Brampton Auto Body", "webhook_token": "shop_bramp_456"}
-    ]
-    """
     raw = os.getenv("SHOPS_JSON")
     if not raw:
-        # Safe default so local testing still works
+        # Safe default for local testing
         default = Shop(
             id="default",
             name="Auto Body Shop",
@@ -65,10 +57,9 @@ def load_shops() -> Dict[str, Shop]:
 SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
 
 # ============================================================
-# In-memory session store (shop + phone -> pre-scan result)
+# In-memory session store
 # ============================================================
 
-# Key: f"{shop.id}:{phone}"
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_TTL_MINUTES = 60
 
@@ -79,17 +70,17 @@ def session_key(shop: Shop, phone: str) -> str:
 
 def cleanup_sessions() -> None:
     now = datetime.utcnow()
-    to_delete: List[str] = []
-    for key, val in SESSIONS.items():
-        created_at = val.get("created_at")
+    expired = []
+    for k, v in SESSIONS.items():
+        created_at = v.get("created_at")
         if isinstance(created_at, datetime):
             if now - created_at > timedelta(minutes=SESSION_TTL_MINUTES):
-                to_delete.append(key)
-    for k in to_delete:
+                expired.append(k)
+    for k in expired:
         SESSIONS.pop(k, None)
 
 # ============================================================
-# Strict vocab – prevent hallucinated panels / damage
+# Allowed areas + damage vocab (KEEPING YOUR FORMAT)
 # ============================================================
 
 ALLOWED_AREAS = [
@@ -101,7 +92,8 @@ ALLOWED_AREAS = [
     "rear left door", "rear right door",
     "left quarter panel", "right quarter panel",
     "hood", "roof", "trunk", "tailgate",
-    "windshield", "rear window", "left windows", "right windows",
+    "windshield", "rear window",
+    "left windows", "right windows",
     "left side mirror", "right side mirror",
     "left headlight", "right headlight",
     "left taillight", "right taillight",
@@ -111,7 +103,6 @@ ALLOWED_AREAS = [
     "left rear tire", "right rear tire",
 ]
 
-# Expanded to capture dents / deformation phrases
 ALLOWED_DAMAGE_TYPES = [
     "light scratch",
     "deep scratch",
@@ -143,25 +134,25 @@ ALLOWED_DAMAGE_TYPES = [
 def clean_areas_from_text(text: str) -> List[str]:
     t = text.lower()
     found = [a for a in ALLOWED_AREAS if a in t]
+    out: List[str] = []
     seen = set()
-    result: List[str] = []
     for a in found:
         if a not in seen:
             seen.add(a)
-            result.append(a)
-    return result
+            out.append(a)
+    return out
 
 
 def clean_damage_types_from_text(text: str) -> List[str]:
     t = text.lower()
     found = [d for d in ALLOWED_DAMAGE_TYPES if d in t]
+    out: List[str] = []
     seen = set()
-    result: List[str] = []
     for d in found:
         if d not in seen:
             seen.add(d)
-            result.append(d)
-    return result
+            out.append(d)
+    return out
 
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
@@ -179,7 +170,7 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     return {}
 
 # ============================================================
-# Twilio media download helpers
+# Media download helpers
 # ============================================================
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -187,73 +178,76 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 
 def download_twilio_media(url: str) -> bytes:
-    """
-    Download a single Twilio media URL using basic auth.
-    Raises on any non-200 or network error.
-    """
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        raise RuntimeError("Twilio credentials are not configured")
-
+        raise RuntimeError("Twilio credentials not set")
     resp = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=20)
     resp.raise_for_status()
     return resp.content
 
 
-def bytes_to_data_url(data: bytes, content_type: str = "image/jpeg") -> str:
-    """
-    Convert raw bytes to a data: URL so OpenAI never has to call Twilio.
-    """
+def bytes_to_data_url(data: bytes, ctype: str = "image/jpeg") -> str:
     b64 = base64.b64encode(data).decode("utf-8")
-    return f"data:{content_type};base64,{b64}"
+    return f"data:{ctype};base64,{b64}"
 
 # ============================================================
-# STEP 1 – PRE-SCAN (areas & basic damage only)
+# PRE-SCAN PROMPT with LEFT/RIGHT FIX + ORIENTATION
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
 You are an automotive DAMAGE PRE-SCAN AI.
 
 Your job:
-- Look at the image(s) of a vehicle.
+- Look at the photo(s) of a vehicle.
 - Identify ONLY the panels/areas that clearly show visible damage.
-- Identify ONLY basic damage types (scratches, dents, scuffs, cracks, curb rash, deformation, etc).
-- Treat crushed / heavily dented / deformed metal as "deep dent" or "panel deformation" or "bumper deformation" in DAMAGE TYPES.
-- DO NOT estimate cost.
-- DO NOT guess.
-- DO NOT mention areas that are not clearly damaged.
-- If you are unsure, keep the list short and say that in the notes.
+- Identify ONLY basic damage types.
+- DO NOT guess or invent areas that are not clearly damaged.
 
-Use natural language, not JSON. Use this format:
+LEFT/RIGHT RULE (IMPORTANT):
+- Always use the DRIVER'S PERSPECTIVE for left/right (sitting inside the car facing forward).
+- NEVER flip orientation based on camera viewing angle.
+- If the angle makes it hard to be 100% sure, you can say “front-left (likely)” or “front-right (likely)” in NOTES,
+  but the AREAS list must still use the correct left/right labels.
+- DO NOT label damage as right-side if it is actually on the left, or vice versa.
+
+ORIENTATION STEP:
+Before listing damage, briefly describe the photo angle:
+Examples:
+- “Photo appears taken from the front-left of the vehicle.”
+- “Photo taken straight from the front.”
+- “Photo appears taken from the front-right.”
+
+FORMAT TO USE:
+
+ORIENTATION:
+- one sentence about camera angle
 
 AREAS:
-- area 1
-- area 2
+- front left fender
+- front bumper upper
+- right headlight
 
 DAMAGE TYPES:
-- type 1
-- type 2
+- deep dent
+- dent
+- panel deformation
+- crack
 
 NOTES:
-- short comment about what you see / any uncertainty
+- short comments about what you see, plus any possible suspension/structural concerns
 """.strip()
 
+# ============================================================
+# Run PRE-SCAN
+# ============================================================
 
 def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
-    """
-    Run OpenAI multi-modal pre-scan on 1–3 images.
-    image_data_urls must be data: URLs (already downloaded from Twilio).
-    Returns: { areas: [...], damage_types: [...], notes: "..." }
-    """
     if not image_data_urls:
-        return {"areas": [], "damage_types": [], "notes": "No images received."}
+        return {"areas": [], "damage_types": [], "notes": "", "raw": ""}
 
     content: List[dict] = [
         {
             "type": "text",
-            "text": (
-                f"Customer photos for {shop.name}. "
-                "Analyze ONLY visible damage according to the PRE-SCAN rules."
-            ),
+            "text": f"Customer photos for {shop.name}. Follow the PRE-SCAN instructions exactly.",
         }
     ]
 
@@ -270,12 +264,12 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     )
 
     raw = completion.choices[0].message.content or ""
+
     areas = clean_areas_from_text(raw)
     damage_types = clean_damage_types_from_text(raw)
 
-    # Try to pull NOTES: line if present, but it's optional
     notes = ""
-    m = re.search(r"NOTES:\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
+    m = re.search(r"NOTES:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
     if m:
         notes = m.group(1).strip()
 
@@ -287,64 +281,65 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     }
 
 
-def build_pre_scan_sms(shop: Shop, pre_scan: Dict[str, Any]) -> str:
-    areas = pre_scan.get("areas", [])
-    damage_types = pre_scan.get("damage_types", [])
-    notes = pre_scan.get("notes", "") or ""
+def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any]) -> str:
+    areas = pre.get("areas", [])
+    damage_types = pre.get("damage_types", [])
+    notes = pre.get("notes", "") or ""
 
-    lines: List[str] = [f"AI Pre-Scan for {shop.name}", ""]
+    msg: List[str] = [f"AI Pre-Scan for {shop.name}", ""]
 
     if areas:
-        lines.append("Here's what I can clearly see from your photo(s):")
+        msg.append("Here's what I can clearly see from your photo(s):")
         for a in areas:
-            lines.append(f"- {a}")
+            msg.append(f"- {a}")
     else:
-        lines.append(
+        msg.append(
             "I couldn't confidently pick out specific damaged panels yet from this angle."
         )
 
     if damage_types:
-        lines.append("")
-        lines.append("Damage types I can see:")
-        lines.append("- " + ", ".join(damage_types))
+        msg.append("")
+        msg.append("Damage types I can see:")
+        msg.append("- " + ", ".join(damage_types))
 
     if notes:
-        lines.append("")
-        lines.append("Notes:")
-        lines.append(notes)
+        msg.append("")
+        msg.append("Notes:")
+        msg.append(notes)
 
-    lines.append("")
-    lines.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
-    lines.append("If it's off, reply 2 and you can send clearer / wider photos.")
+    msg.append("")
+    msg.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
+    msg.append("If it's off, reply 2 and you can send clearer / wider photos.")
 
-    return "\n".join(lines)
+    return "\n".join(msg)
 
 # ============================================================
-# STEP 2 – FULL ESTIMATE (severity + cost, Ontario 2025)
+# ESTIMATE SYSTEM PROMPT
 # ============================================================
 
 ESTIMATE_SYSTEM_PROMPT = """
 You are an experienced collision estimator in Ontario, Canada (year 2025).
 
 You receive:
-- A list of CONFIRMED damaged areas.
-- A list of basic damage types.
-- Optional notes describing the visible damage (for example: "trunk lid is heavily dented and deformed").
+- CONFIRMED damaged areas (only from the photo-based pre-scan).
+- CONFIRMED basic damage types.
+- Optional notes (for example: “hood is heavily dented and deformed on the left side.”).
 
 Your tasks:
-1) Classify severity: "minor", "moderate", or "severe" (or "unknown" if impossible).
+1) Classify severity: "minor", "moderate", "severe", or "unknown".
 2) Provide a realistic repair cost range in CAD (min_cost, max_cost) for labour + materials.
 3) Write a short, customer-friendly explanation (2–4 sentences).
-4) Keep it clearly a visual, preliminary estimate (not a final bill).
+4) Include a brief disclaimer that this is a visual preliminary estimate only.
 
 Severity guidance:
-- Crushed, heavily dented, caved-in, or clearly deformed panels on structural areas (trunk, hood, bumpers, quarter panels, roof) are usually "moderate" or "severe", not "minor".
+- Crushed, heavily dented, caved-in, or clearly deformed panels on structural areas (trunk, hood, bumpers, quarter panels, roof)
+  are usually "moderate" or "severe", not "minor".
 - Small cosmetic scratches or scuffs on a single panel with no deformation are usually "minor".
-- Multiple damaged panels or combined deformation + cracks typically push severity to at least "moderate" or "severe".
+- Multiple damaged panels or combined deformation + cracks typically mean "moderate" or "severe".
 
-STRICT RULE:
+STRICT RULES:
 - NEVER add new panels or areas beyond those given.
-- If the confirmed areas list is empty, set severity to "unknown" and keep cost very low or 0–200.
+- If confirmed areas list is empty, set severity to "unknown" and keep cost very low or 0–200.
 
 Output JSON ONLY in this exact schema:
 
@@ -357,6 +352,9 @@ Output JSON ONLY in this exact schema:
 }
 """.strip()
 
+# ============================================================
+# Run ESTIMATE + sanity adjustments
+# ============================================================
 
 def run_estimate(
     shop: Shop,
@@ -382,10 +380,7 @@ def run_estimate(
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(payload),
-                    }
+                    {"type": "text", "text": json.dumps(payload)},
                 ],
             },
         ],
@@ -398,25 +393,18 @@ def run_estimate(
     if severity not in {"minor", "moderate", "severe", "unknown"}:
         severity = "unknown"
 
-    try:
-        min_cost = float(data.get("min_cost", 0) or 0)
-    except (TypeError, ValueError):
-        min_cost = 0.0
-
-    try:
-        max_cost = float(data.get("max_cost", 0) or 0)
-    except (TypeError, ValueError):
-        max_cost = 0.0
-
-    summary = str(data.get("summary", "")).strip()
-    disclaimer = str(data.get("disclaimer", "")).strip()
+    def _float(val, default=0.0) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return float(default)
 
     estimate = {
         "severity": severity,
-        "min_cost": min_cost,
-        "max_cost": max_cost,
-        "summary": summary,
-        "disclaimer": disclaimer,
+        "min_cost": _float(data.get("min_cost", 0)),
+        "max_cost": _float(data.get("max_cost", 0)),
+        "summary": str(data.get("summary", "")).strip(),
+        "disclaimer": str(data.get("disclaimer", "")).strip(),
     }
 
     return sanity_adjust_estimate(estimate, areas, damage_types, notes)
@@ -428,16 +416,15 @@ def sanity_adjust_estimate(
     damage_types: List[str],
     notes: str = "",
 ) -> Dict[str, Any]:
-    # Base values from the model
     severity = estimate.get("severity", "unknown").lower()
-    try:
-        min_cost = float(estimate.get("min_cost", 0) or 0)
-    except (TypeError, ValueError):
-        min_cost = 0.0
-    try:
-        max_cost = float(estimate.get("max_cost", 0) or 0)
-    except (TypeError, ValueError):
-        max_cost = 0.0
+    def _float(val, default=0.0) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return float(default)
+
+    min_cost = _float(estimate.get("min_cost", 0))
+    max_cost = _float(estimate.get("max_cost", 0))
 
     lowered_areas = [a.lower() for a in areas]
     lowered_types = [d.lower() for d in damage_types]
@@ -447,9 +434,7 @@ def sanity_adjust_estimate(
     tire_like = [a for a in lowered_areas if "tire" in a]
     non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
 
-    # ------------------------------------------------------------
-    # 1) Wheel-only jobs: clamp to realistic cosmetic / bent wheel numbers
-    # ------------------------------------------------------------
+    # 1) Wheel-only jobs
     if non_wheel_panels == [] and (wheel_like or tire_like):
         serious = any(
             key in " ".join(lowered_types)
@@ -464,9 +449,7 @@ def sanity_adjust_estimate(
             max_cost = max(max_cost, 450)
             severity = "minor"
 
-    # ------------------------------------------------------------
-    # 2) Heavy deformation / crushed metal overrides
-    # ------------------------------------------------------------
+    # 2) Heavy deformation overrides
     severity_rank = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3}
     rank_to_label = {v: k for k, v in severity_rank.items()}
     current_rank = severity_rank.get(severity, 0)
@@ -503,24 +486,17 @@ def sanity_adjust_estimate(
     has_structural = any(p in lowered_areas for p in structural_panels)
 
     if has_heavy and has_structural:
-        # Crushed / deformed structural panels should never be "minor"
         current_rank = max(current_rank, severity_rank["severe"])
     elif has_heavy:
         current_rank = max(current_rank, severity_rank["moderate"])
 
-    # ------------------------------------------------------------
-    # 3) Multi-panel damage heuristic
-    # ------------------------------------------------------------
+    # 3) Multi-panel heuristic
     if len(non_wheel_panels) >= 3:
-        # More than 2 non-wheel panels with damage is rarely truly minor
         current_rank = max(current_rank, severity_rank["moderate"])
 
-    # Final severity from rank
     severity = rank_to_label.get(current_rank, severity)
 
-    # ------------------------------------------------------------
-    # 4) General guardrails on cost ranges
-    # ------------------------------------------------------------
+    # 4) Guardrails on cost
     if severity == "minor":
         if min_cost <= 0:
             min_cost = 150
@@ -569,7 +545,6 @@ def build_estimate_sms(
     )
 
     estimate_id = str(uuid.uuid4())
-
     areas_str = ", ".join(areas) if areas else "not clearly identified yet"
     dmg_str = ", ".join(damage_types) if damage_types else "not clearly classified yet"
 
@@ -594,22 +569,20 @@ def build_estimate_sms(
     return "\n".join(lines)
 
 # ============================================================
-# Twilio webhook: multi-shop + 2-step flow (with XML replies)
+# Twilio webhook (2-step flow)
 # ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
-    """
-    Twilio hits:
-    https://YOUR-RAILWAY-DOMAIN/sms-webhook?token=SHOP_WEBHOOK_TOKEN
-    """
     token = request.query_params.get("token")
     shop = SHOPS_BY_TOKEN.get(token) if token else None
 
     reply = MessagingResponse()
 
     if not shop:
-        reply.message("This number is not configured correctly. Please contact the body shop directly.")
+        reply.message(
+            "This number is not configured correctly. Please contact the body shop directly."
+        )
         return Response(content=str(reply), media_type="application/xml")
 
     try:
@@ -627,23 +600,19 @@ async def sms_webhook(request: Request):
         key = session_key(shop, from_number)
         lower_body = body.lower()
 
-        # --------------------------------------------------------
-        # CASE 1 — MMS received → download from Twilio → PRE-SCAN
-        # --------------------------------------------------------
+        # CASE 1 – MMS received: run PRE-SCAN
         if num_media > 0:
             image_data_urls: List[str] = []
 
             for i in range(num_media):
                 media_url = form.get(f"MediaUrl{i}")
                 content_type = form.get(f"MediaContentType{i}") or "image/jpeg"
-
                 if not media_url:
                     continue
 
                 try:
                     raw = download_twilio_media(media_url)
                 except Exception:
-                    # Twilio 11200-style failures show up here
                     reply.message(
                         "Sorry — I couldn't download the photos from your carrier. "
                         "Please resend 1–3 clear photos of the damaged area."
@@ -668,7 +637,6 @@ async def sms_webhook(request: Request):
                     )
                     return Response(content=str(reply), media_type="application/xml")
 
-                # Store full pre-scan info (including notes) for step 2
                 SESSIONS[key] = {
                     "areas": pre_scan.get("areas", []),
                     "damage_types": pre_scan.get("damage_types", []),
@@ -681,9 +649,7 @@ async def sms_webhook(request: Request):
 
             return Response(content=str(reply), media_type="application/xml")
 
-        # --------------------------------------------------------
-        # CASE 2 — Customer replies 1 (confirm pre-scan)
-        # --------------------------------------------------------
+        # CASE 2 – Customer replies 1 (confirm pre-scan)
         if lower_body in {"1", "yes", "y"}:
             session = SESSIONS.get(key)
             if not session:
@@ -716,9 +682,7 @@ async def sms_webhook(request: Request):
             reply.message(text)
             return Response(content=str(reply), media_type="application/xml")
 
-        # --------------------------------------------------------
-        # CASE 3 — Customer replies 2 (pre-scan is wrong)
-        # --------------------------------------------------------
+        # CASE 3 – Customer replies 2 (pre-scan is wrong)
         if lower_body in {"2", "no", "n"}:
             SESSIONS.pop(key, None)
             reply.message(
@@ -727,9 +691,7 @@ async def sms_webhook(request: Request):
             )
             return Response(content=str(reply), media_type="application/xml")
 
-        # --------------------------------------------------------
-        # CASE 4 — Default instructions (no media, no 1/2)
-        # --------------------------------------------------------
+        # CASE 4 – Default instructions
         instructions = (
             f"Hi from {shop.name}!\n\n"
             "To get an AI-powered damage estimate:\n"
@@ -739,7 +701,6 @@ async def sms_webhook(request: Request):
             "4) Then I'll send your full Ontario 2025 cost estimate.\n\n"
             "You can start by sending photos now."
         )
-
         reply.message(instructions)
         return Response(content=str(reply), media_type="application/xml")
 
@@ -748,15 +709,11 @@ async def sms_webhook(request: Request):
         return Response(content=str(reply), media_type="application/xml")
 
 # ============================================================
-# Admin helper: see shops & webhook URLs
+# Admin: list shops + example webhook URLs
 # ============================================================
 
 @app.get("/admin/shops")
 async def list_shops():
-    """
-    Simple JSON view to confirm SHOPS_JSON + webhook URLs.
-    (You can protect this behind an admin key later if needed.)
-    """
     base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     result = []
     for shop in SHOPS_BY_TOKEN.values():
