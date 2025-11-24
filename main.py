@@ -3,6 +3,7 @@ import json
 import re
 import base64
 import uuid
+import traceback
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -1140,7 +1141,7 @@ async def sms_webhook(request: Request):
 
             return Response(content=str(reply), media_type="application/xml")
 
-        # B) Reply 1 -> confirm pre-scan, send estimate + save to DB
+        # B) Reply 1 -> confirm pre-scan, send estimate (DB failures logged but don't break SMS)
         if lower_body in {"1", "yes", "y"}:
             if not session.get("areas") and not session.get("damage_types"):
                 reply.message(
@@ -1149,45 +1150,56 @@ async def sms_webhook(request: Request):
                 )
                 return Response(content=str(reply), media_type="application/xml")
 
-            with db_session() as db:
-                customer = get_or_create_customer(db, phone=from_number)
+            vin_info = session.get("vin_info")
 
-                vin_info = session.get("vin_info")
-                if vin_info:
-                    upsert_vehicle_from_vin(db, customer, vin_info)
+            try:
+                # 1) Generate estimate first (no DB yet)
+                estimate = run_estimate(
+                    shop,
+                    session.get("areas", []),
+                    session.get("damage_types", []),
+                    session.get("notes", ""),
+                )
+                session["last_estimate"] = estimate
+                SESSIONS[key] = session
 
+                # 2) Try to save to DB, but don't break SMS if DB fails
                 try:
-                    estimate = run_estimate(
-                        shop,
-                        session.get("areas", []),
-                        session.get("damage_types", []),
-                        session.get("notes", ""),
-                    )
-                    session["last_estimate"] = estimate
-                    SESSIONS[key] = session
+                    with db_session() as db:
+                        customer = get_or_create_customer(db, phone=from_number)
 
-                    save_estimate_record(
-                        db,
-                        customer=customer,
-                        shop_id=shop.id,
-                        areas=session.get("areas", []),
-                        damage_types=session.get("damage_types", []),
-                        estimate=estimate,
-                        notes=session.get("notes", ""),
-                    )
+                        if vin_info:
+                            upsert_vehicle_from_vin(db, customer, vin_info)
 
-                    text = build_estimate_sms(
-                        shop,
-                        session.get("areas", []),
-                        session.get("damage_types", []),
-                        estimate,
-                        vin_info=vin_info,
-                    )
-                except Exception:
-                    text = (
-                        "Sorry — I couldn’t generate the estimate. "
-                        "Please resend the photos to start again."
-                    )
+                        save_estimate_record(
+                            db,
+                            customer=customer,
+                            shop_id=shop.id,
+                            areas=session.get("areas", []),
+                            damage_types=session.get("damage_types", []),
+                            estimate=estimate,
+                            notes=session.get("notes", ""),
+                        )
+                except Exception as db_err:
+                    print("DB error while saving estimate:", repr(db_err))
+                    traceback.print_exc()
+
+                # 3) Build the SMS to send to the customer
+                text = build_estimate_sms(
+                    shop,
+                    session.get("areas", []),
+                    session.get("damage_types", []),
+                    estimate,
+                    vin_info=vin_info,
+                )
+
+            except Exception as e:
+                print("ERROR in estimate generation:", repr(e))
+                traceback.print_exc()
+                text = (
+                    "Sorry — I couldn’t generate the estimate just now. "
+                    "Please resend the photos to start again."
+                )
 
             reply.message(text)
             return Response(content=str(reply), media_type="application/xml")
@@ -1301,8 +1313,12 @@ async def sms_webhook(request: Request):
         reply.message(instructions)
         return Response(content=str(reply), media_type="application/xml")
 
-    except Exception:
-        reply.message("Unexpected error. Please send the photos again.")
+    except Exception as e:
+        print("UNEXPECTED ERROR in sms-webhook:", repr(e))
+        traceback.print_exc()
+        reply.message(
+            "Unexpected error on our side. Please try again in a moment or resend your photos."
+        )
         return Response(content=str(reply), media_type="application/xml")
 
 # ============================================================
