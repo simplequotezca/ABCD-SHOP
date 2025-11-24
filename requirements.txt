@@ -5,6 +5,8 @@ requests
 twilio
 openai
 pydantic
+SQLAlchemy
+psycopg2-binary
 google-api-python-client
 google-auth
 google-auth-httplib2
