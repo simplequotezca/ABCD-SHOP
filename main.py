@@ -13,6 +13,208 @@ from pydantic import BaseModel
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
+# ===========================
+# SQLAlchemy (PostgreSQL ONLY)
+# ===========================
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Integer,
+    Float,
+    DateTime,
+    Text,
+    JSON,
+    ForeignKey,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from contextlib import contextmanager
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required for PostgreSQL database")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    full_name = Column(String, nullable=True)
+    phone = Column(String, nullable=False, index=True)
+    email = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    vehicles = relationship("Vehicle", back_populates="customer")
+    estimates = relationship("Estimate", back_populates="customer")
+    bookings = relationship("Booking", back_populates="customer")
+
+
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    vin = Column(String, nullable=True)
+    year = Column(String, nullable=True)
+    make = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    body_style = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship("Customer", back_populates="vehicles")
+
+
+class Estimate(Base):
+    __tablename__ = "estimates"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    shop_id = Column(String, nullable=False)
+    areas = Column(JSON, nullable=True)
+    damage_types = Column(JSON, nullable=True)
+    severity = Column(String, nullable=True)
+    min_cost = Column(Integer, nullable=True)
+    max_cost = Column(Integer, nullable=True)
+    line_items = Column(JSON, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship("Customer", back_populates="estimates")
+
+
+class Booking(Base):
+    __tablename__ = "bookings"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    shop_id = Column(String, nullable=False)
+    appointment_time = Column(DateTime, nullable=False)
+    calendar_event_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship("Customer", back_populates="bookings")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+@contextmanager
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_or_create_customer(
+    db, phone: str, full_name: Optional[str] = None, email: Optional[str] = None
+) -> Customer:
+    customer = db.query(Customer).filter(Customer.phone == phone).first()
+    if customer:
+        updated = False
+        if full_name and not customer.full_name:
+            customer.full_name = full_name
+            updated = True
+        if email and not customer.email:
+            customer.email = email
+            updated = True
+        if updated:
+            db.add(customer)
+        return customer
+
+    customer = Customer(full_name=full_name, phone=phone, email=email)
+    db.add(customer)
+    db.flush()
+    return customer
+
+
+def upsert_vehicle_from_vin(
+    db, customer: Customer, vin_info: Dict[str, str]
+) -> Optional[Vehicle]:
+    vin = vin_info.get("vin")
+    if not vin:
+        return None
+
+    vehicle = (
+        db.query(Vehicle)
+        .filter(Vehicle.customer_id == customer.id, Vehicle.vin == vin)
+        .first()
+    )
+    if not vehicle:
+        vehicle = Vehicle(
+            customer_id=customer.id,
+            vin=vin,
+            year=vin_info.get("year"),
+            make=vin_info.get("make"),
+            model=vin_info.get("model"),
+            body_style=vin_info.get("body_style"),
+        )
+        db.add(vehicle)
+        db.flush()
+    else:
+        changed = False
+        for field in ["year", "make", "model", "body_style"]:
+            val = vin_info.get(field)
+            if val and getattr(vehicle, field) != val:
+                setattr(vehicle, field, val)
+                changed = True
+        if changed:
+            db.add(vehicle)
+    return vehicle
+
+
+def save_estimate_record(
+    db,
+    customer: Customer,
+    shop_id: str,
+    areas: List[str],
+    damage_types: List[str],
+    estimate: Dict[str, Any],
+    notes: str,
+) -> Estimate:
+    est = Estimate(
+        customer_id=customer.id,
+        shop_id=shop_id,
+        areas=areas or [],
+        damage_types=damage_types or [],
+        severity=estimate.get("severity"),
+        min_cost=int(estimate.get("min_cost") or 0),
+        max_cost=int(estimate.get("max_cost") or 0),
+        line_items=estimate.get("line_items") or [],
+        notes=notes or "",
+    )
+    db.add(est)
+    db.flush()
+    return est
+
+
+def save_booking_record(
+    db,
+    customer: Customer,
+    shop_id: str,
+    appointment_time: datetime,
+    calendar_event_id: Optional[str],
+) -> Booking:
+    booking = Booking(
+        customer_id=customer.id,
+        shop_id=shop_id,
+        appointment_time=appointment_time,
+        calendar_event_id=calendar_event_id,
+    )
+    db.add(booking)
+    db.flush()
+    return booking
+
+
 # ============================================================
 # FastAPI + OpenAI setup
 # ============================================================
@@ -37,6 +239,7 @@ class ShopPricing(BaseModel):
     severe_min: float = 2000.0
     severe_max: float = 6000.0
 
+
 class Shop(BaseModel):
     id: str
     name: str
@@ -48,7 +251,6 @@ class Shop(BaseModel):
 def load_shops() -> Dict[str, Shop]:
     raw = os.getenv("SHOPS_JSON")
     if not raw:
-        # Safe default for local testing
         default = Shop(
             id="default",
             name="Auto Body Shop",
@@ -59,7 +261,6 @@ def load_shops() -> Dict[str, Shop]:
     data = json.loads(raw)
     by_token: Dict[str, Shop] = {}
     for item in data:
-        # allow missing pricing / calendar_id
         pricing_obj = None
         if "pricing" in item and isinstance(item["pricing"], dict):
             try:
@@ -80,11 +281,11 @@ def load_shops() -> Dict[str, Shop]:
 SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
 
 # ============================================================
-# In-memory session store
+# In-memory session store (per shop+phone)
 # ============================================================
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_MINUTES = 120  # keep longer so we can book after estimate
+SESSION_TTL_MINUTES = 120
 
 
 def session_key(shop: Shop, phone: str) -> str:
@@ -213,7 +414,7 @@ def bytes_to_data_url(data: bytes, ctype: str = "image/jpeg") -> str:
     return f"data:{ctype};base64,{b64}"
 
 # ============================================================
-# VIN decoding via OpenAI (no external VIN API needed)
+# VIN decoding via OpenAI (no external VIN API)
 # ============================================================
 
 VIN_SYSTEM_PROMPT = """
@@ -269,7 +470,7 @@ def decode_vin_with_ai(vin: str) -> Dict[str, str]:
     }
 
 # ============================================================
-# PRE-SCAN (multi-image "fusion" + left/right fix)
+# PRE-SCAN (multi-image fusion + left/right fix)
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
@@ -346,7 +547,6 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     areas = clean_areas_from_text(raw)
     damage_types = clean_damage_types_from_text(raw)
 
-    # Extract NOTES block if present
     notes = ""
     m = re.search(r"NOTES:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
     if m:
@@ -360,7 +560,9 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     }
 
 
-def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any], vin_info: Optional[Dict[str, str]] = None) -> str:
+def build_pre_scan_sms(
+    shop: Shop, pre: Dict[str, Any], vin_info: Optional[Dict[str, str]] = None
+) -> str:
     areas = pre.get("areas", [])
     damage_types = pre.get("damage_types", [])
     notes = pre.get("notes", "") or ""
@@ -394,10 +596,14 @@ def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any], vin_info: Optional[Dict[
         lines.append(notes)
 
     lines.append("")
-    lines.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
+    lines.append(
+        "If this looks roughly correct, reply 1 and I'll send a full estimate with cost."
+    )
     lines.append("If it's off, reply 2 and you can send clearer / wider photos.")
     lines.append("")
-    lines.append("Optional: you can also text your 17-character VIN to decode your vehicle details.")
+    lines.append(
+        "Optional: you can also text your 17-character VIN to decode your vehicle details."
+    )
 
     return "\n".join(lines)
 
@@ -531,7 +737,7 @@ def sanity_adjust_estimate(
     tire_like = [a for a in lowered_areas if "tire" in a]
     non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
 
-    # 1) Wheel-only jobs
+    # Wheel-only jobs
     if non_wheel_panels == [] and (wheel_like or tire_like):
         serious = any(
             key in " ".join(lowered_types)
@@ -546,7 +752,7 @@ def sanity_adjust_estimate(
             max_cost = max(max_cost, 450)
             severity = "minor"
 
-    # 2) Heavy deformation overrides
+    # Heavy deformation overrides
     severity_rank = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3}
     rank_to_label = {v: k for k, v in severity_rank.items()}
     current_rank = severity_rank.get(severity, 0)
@@ -587,13 +793,13 @@ def sanity_adjust_estimate(
     elif has_heavy:
         current_rank = max(current_rank, severity_rank["moderate"])
 
-    # 3) Multi-panel heuristic
+    # Multi-panel heuristic
     if len(non_wheel_panels) >= 3:
         current_rank = max(current_rank, severity_rank["moderate"])
 
     severity = rank_to_label.get(current_rank, severity)
 
-    # 4) Shop-specific pricing if available
+    # Shop-specific pricing
     pricing = shop.pricing
     if pricing:
         if severity == "minor":
@@ -605,11 +811,10 @@ def sanity_adjust_estimate(
         elif severity == "severe":
             min_cost = max(min_cost, pricing.severe_min)
             max_cost = max(max_cost, pricing.severe_max)
-        else:  # unknown
+        else:
             if min_cost <= 0 and max_cost <= 0:
                 min_cost, max_cost = 0, 200
     else:
-        # generic guardrails
         if severity == "minor":
             if min_cost <= 0:
                 min_cost = 150
@@ -626,7 +831,7 @@ def sanity_adjust_estimate(
                 min_cost = 2000
             if max_cost <= 0 or max_cost < min_cost:
                 max_cost = min_cost + 6000
-        else:  # unknown
+        else:
             if min_cost <= 0 and max_cost <= 0:
                 min_cost, max_cost = 0, 200
 
@@ -643,7 +848,7 @@ def sanity_adjust_estimate(
     return estimate
 
 # ============================================================
-# AI explanation text (customer-friendly damage explainer)
+# AI explanation text
 # ============================================================
 
 EXPLANATION_SYSTEM_PROMPT = """
@@ -657,7 +862,7 @@ You receive:
 Write a short, very clear explanation (2–4 sentences) that:
 - Explains WHAT is damaged, panel by panel.
 - Explains in simple terms why the severity is minor/moderate/severe.
-- Does NOT talk about pricing or dollars (that is already handled elsewhere).
+- Does NOT talk about pricing or dollars.
 - Sounds friendly and professional.
 
 Return plain text only (no JSON, no bullet points).
@@ -716,10 +921,7 @@ def build_estimate_sms(
     areas_str = ", ".join(areas) if areas else "not clearly identified yet"
     dmg_str = ", ".join(damage_types) if damage_types else "not clearly classified yet"
 
-    lines: List[str] = [
-        f"AI Damage Estimate for {shop.name}",
-        "",
-    ]
+    lines: List[str] = [f"AI Damage Estimate for {shop.name}", ""]
 
     if vin_info and vin_info.get("vin"):
         lines.append(
@@ -741,11 +943,10 @@ def build_estimate_sms(
         lines.append("")
         lines.append(summary)
 
-    # Line-item preview (compressed)
     if line_items:
         lines.append("")
         lines.append("Line-item breakdown:")
-        for item in line_items[:6]:  # limit for SMS length
+        for item in line_items[:6]:
             panel = item.get("panel", "panel")
             op = item.get("operation", "operation")
             hrs = item.get("hours", 0)
@@ -768,7 +969,7 @@ def build_estimate_sms(
     return "\n".join(lines)
 
 # ============================================================
-# Google Calendar integration (optional, service account)
+# Google Calendar integration (optional)
 # ============================================================
 
 def create_calendar_event_for_booking(
@@ -778,25 +979,20 @@ def create_calendar_event_for_booking(
     customer_phone: str,
     appt_start_iso: str,
     session: Dict[str, Any],
-) -> Tuple[bool, str]:
-    """
-    Creates a Google Calendar event if Google libraries + credentials are configured.
-    Returns (success, message).
-    """
-    # If no calendar configured for this shop, do nothing
+) -> Tuple[bool, str, Optional[str]]:
     calendar_id = shop.calendar_id or os.getenv("GOOGLE_CALENDAR_ID")
     if not calendar_id:
-        return False, "Calendar ID not configured."
+        return False, "Calendar ID not configured.", None
 
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
     except ImportError:
-        return False, "Google Calendar libraries not installed."
+        return False, "Google Calendar libraries not installed.", None
 
     service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not service_account_json:
-        return False, "Google service account JSON not configured."
+        return False, "Google service account JSON not configured.", None
 
     try:
         info = json.loads(service_account_json)
@@ -806,9 +1002,8 @@ def create_calendar_event_for_booking(
         )
         service = build("calendar", "v3", credentials=creds)
     except Exception as e:
-        return False, f"Failed to init Calendar client: {e}"
+        return False, f"Failed to init Calendar client: {e}", None
 
-    # Build event body
     start_dt = datetime.fromisoformat(appt_start_iso)
     end_dt = start_dt + timedelta(hours=1)
 
@@ -853,13 +1048,14 @@ def create_calendar_event_for_booking(
     }
 
     try:
-        service.events().insert(calendarId=calendar_id, body=event).execute()
-        return True, "Booking added to calendar."
+        created = service.events().insert(calendarId=calendar_id, body=event).execute()
+        event_id = created.get("id")
+        return True, "Booking added to calendar.", event_id
     except Exception as e:
-        return False, f"Failed to create calendar event: {e}"
+        return False, f"Failed to create calendar event: {e}", None
 
 # ============================================================
-# Twilio webhook (MMS + VIN + estimate + booking)
+# Twilio webhook (MMS + VIN + estimate + booking + DB)
 # ============================================================
 
 @app.post("/sms-webhook")
@@ -891,7 +1087,7 @@ async def sms_webhook(request: Request):
         session = SESSIONS.get(key) or {}
         lower_body = body.lower()
 
-        # CASE A: Incoming MMS with photos -> run PRE-SCAN
+        # A) Incoming MMS -> PRE-SCAN
         if num_media > 0:
             image_data_urls: List[str] = []
 
@@ -944,7 +1140,7 @@ async def sms_webhook(request: Request):
 
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE B: Reply 1 -> confirm pre-scan, send estimate
+        # B) Reply 1 -> confirm pre-scan, send estimate + save to DB
         if lower_body in {"1", "yes", "y"}:
             if not session.get("areas") and not session.get("damage_types"):
                 reply.message(
@@ -953,33 +1149,50 @@ async def sms_webhook(request: Request):
                 )
                 return Response(content=str(reply), media_type="application/xml")
 
-            try:
-                estimate = run_estimate(
-                    shop,
-                    session.get("areas", []),
-                    session.get("damage_types", []),
-                    session.get("notes", ""),
-                )
-                session["last_estimate"] = estimate
-                SESSIONS[key] = session
+            with db_session() as db:
+                customer = get_or_create_customer(db, phone=from_number)
 
-                text = build_estimate_sms(
-                    shop,
-                    session.get("areas", []),
-                    session.get("damage_types", []),
-                    estimate,
-                    vin_info=session.get("vin_info"),
-                )
-            except Exception:
-                text = (
-                    "Sorry — I couldn’t generate the estimate. "
-                    "Please resend the photos to start again."
-                )
+                vin_info = session.get("vin_info")
+                if vin_info:
+                    upsert_vehicle_from_vin(db, customer, vin_info)
+
+                try:
+                    estimate = run_estimate(
+                        shop,
+                        session.get("areas", []),
+                        session.get("damage_types", []),
+                        session.get("notes", ""),
+                    )
+                    session["last_estimate"] = estimate
+                    SESSIONS[key] = session
+
+                    save_estimate_record(
+                        db,
+                        customer=customer,
+                        shop_id=shop.id,
+                        areas=session.get("areas", []),
+                        damage_types=session.get("damage_types", []),
+                        estimate=estimate,
+                        notes=session.get("notes", ""),
+                    )
+
+                    text = build_estimate_sms(
+                        shop,
+                        session.get("areas", []),
+                        session.get("damage_types", []),
+                        estimate,
+                        vin_info=vin_info,
+                    )
+                except Exception:
+                    text = (
+                        "Sorry — I couldn’t generate the estimate. "
+                        "Please resend the photos to start again."
+                    )
 
             reply.message(text)
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE C: Reply 2 -> pre-scan wrong, ask for new photos
+        # C) Reply 2 -> pre-scan wrong
         if lower_body in {"2", "no", "n"}:
             SESSIONS.pop(key, None)
             reply.message(
@@ -988,7 +1201,7 @@ async def sms_webhook(request: Request):
             )
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE D: VIN message (standalone 17-char VIN)
+        # D) VIN message
         stripped = body.replace(" ", "").upper()
         if len(stripped) == 17 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", stripped):
             vin_info = decode_vin_with_ai(stripped)
@@ -996,6 +1209,10 @@ async def sms_webhook(request: Request):
             if "created_at" not in session:
                 session["created_at"] = datetime.utcnow()
             SESSIONS[key] = session
+
+            with db_session() as db:
+                customer = get_or_create_customer(db, phone=from_number)
+                upsert_vehicle_from_vin(db, customer, vin_info)
 
             msg = [
                 "VIN decoded:",
@@ -1007,7 +1224,7 @@ async def sms_webhook(request: Request):
             reply.message("\n".join(msg))
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE E: Booking request: "BOOK; Name; email; 2025-12-01 10:30"
+        # E) Booking request: "BOOK; Name; email; 2025-12-01 10:30"
         if lower_body.startswith("book"):
             parts = [p.strip() for p in body.split(";")]
             if len(parts) < 4:
@@ -1023,7 +1240,6 @@ async def sms_webhook(request: Request):
             dt_str = dt_str.strip()
 
             try:
-                # parse naive local time in America/Toronto
                 appt_dt = datetime.fromisoformat(dt_str)
                 appt_iso = appt_dt.isoformat()
             except Exception:
@@ -1033,14 +1249,27 @@ async def sms_webhook(request: Request):
                 )
                 return Response(content=str(reply), media_type="application/xml")
 
-            success, msg = create_calendar_event_for_booking(
-                shop,
-                customer_name=full_name,
-                customer_email=email,
-                customer_phone=from_number,
-                appt_start_iso=appt_iso,
-                session=session,
-            )
+            with db_session() as db:
+                customer = get_or_create_customer(
+                    db, phone=from_number, full_name=full_name, email=email
+                )
+
+                success, msg, event_id = create_calendar_event_for_booking(
+                    shop,
+                    customer_name=full_name,
+                    customer_email=email,
+                    customer_phone=from_number,
+                    appt_start_iso=appt_iso,
+                    session=session,
+                )
+
+                save_booking_record(
+                    db,
+                    customer=customer,
+                    shop_id=shop.id,
+                    appointment_time=appt_dt,
+                    calendar_event_id=event_id,
+                )
 
             if success:
                 reply.message(
@@ -1053,11 +1282,10 @@ async def sms_webhook(request: Request):
                     f"{msg}\n\nThe shop will follow up to confirm your time."
                 )
 
-            # keep session data for reference
             SESSIONS[key] = session
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE F: Default instructions (no photos, not 1/2, not VIN, not BOOK)
+        # F) Default instructions
         instructions = (
             f"Hi from {shop.name}!\n\n"
             "To get an AI-powered damage estimate:\n"
@@ -1109,4 +1337,7 @@ async def list_shops():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Multi-shop AI damage estimator with fusion, VIN & booking is running"}
+    return {
+        "status": "ok",
+        "message": "AI damage estimator with DB, fusion, VIN & booking is running",
+    }
