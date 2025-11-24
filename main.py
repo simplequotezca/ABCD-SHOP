@@ -4,7 +4,7 @@ import re
 import base64
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Request
@@ -29,10 +29,20 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Multi-shop config (tokenized routing via SHOPS_JSON)
 # ============================================================
 
+class ShopPricing(BaseModel):
+    minor_min: float = 150.0
+    minor_max: float = 750.0
+    moderate_min: float = 600.0
+    moderate_max: float = 2500.0
+    severe_min: float = 2000.0
+    severe_max: float = 6000.0
+
 class Shop(BaseModel):
     id: str
     name: str
     webhook_token: str  # used as ?token=... in Twilio URL
+    calendar_id: Optional[str] = None  # optional Google Calendar ID
+    pricing: Optional[ShopPricing] = None  # optional custom pricing
 
 
 def load_shops() -> Dict[str, Shop]:
@@ -49,7 +59,20 @@ def load_shops() -> Dict[str, Shop]:
     data = json.loads(raw)
     by_token: Dict[str, Shop] = {}
     for item in data:
-        shop = Shop(**item)
+        # allow missing pricing / calendar_id
+        pricing_obj = None
+        if "pricing" in item and isinstance(item["pricing"], dict):
+            try:
+                pricing_obj = ShopPricing(**item["pricing"])
+            except Exception:
+                pricing_obj = None
+        shop = Shop(
+            id=item.get("id", "unknown"),
+            name=item.get("name", "Auto Body Shop"),
+            webhook_token=item["webhook_token"],
+            calendar_id=item.get("calendar_id"),
+            pricing=pricing_obj,
+        )
         by_token[shop.webhook_token] = shop
     return by_token
 
@@ -61,7 +84,7 @@ SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
 # ============================================================
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_MINUTES = 60
+SESSION_TTL_MINUTES = 120  # keep longer so we can book after estimate
 
 
 def session_key(shop: Shop, phone: str) -> str:
@@ -80,7 +103,7 @@ def cleanup_sessions() -> None:
         SESSIONS.pop(k, None)
 
 # ============================================================
-# Allowed areas + damage vocab (KEEPING YOUR FORMAT)
+# Allowed areas + damage vocab
 # ============================================================
 
 ALLOWED_AREAS = [
@@ -170,7 +193,7 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     return {}
 
 # ============================================================
-# Media download helpers
+# Media download helpers (Twilio)
 # ============================================================
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -190,55 +213,109 @@ def bytes_to_data_url(data: bytes, ctype: str = "image/jpeg") -> str:
     return f"data:{ctype};base64,{b64}"
 
 # ============================================================
-# PRE-SCAN PROMPT with LEFT/RIGHT FIX + ORIENTATION
+# VIN decoding via OpenAI (no external VIN API needed)
+# ============================================================
+
+VIN_SYSTEM_PROMPT = """
+You are a VIN decoding assistant.
+
+You receive a single 17-character VIN string.
+Your job:
+- Decode the VIN into vehicle year, make, model, and body style IF POSSIBLE.
+- If you are not at least 90% sure, set any unknown field to "unknown".
+- NEVER invent trim levels or package names.
+- Only include: year, make, model, body_style.
+
+Respond in strict JSON:
+
+{
+  "year": "YYYY or unknown",
+  "make": "Ford or unknown",
+  "model": "F-150 or unknown",
+  "body_style": "sedan / SUV / truck / coupe / unknown"
+}
+""".strip()
+
+
+def decode_vin_with_ai(vin: str) -> Dict[str, str]:
+    vin = vin.strip().upper()
+    if len(vin) != 17 or not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
+        return {
+            "vin": vin,
+            "year": "unknown",
+            "make": "unknown",
+            "model": "unknown",
+            "body_style": "unknown",
+        }
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": VIN_SYSTEM_PROMPT},
+            {"role": "user", "content": [{"type": "text", "text": vin}]},
+        ],
+    )
+    raw = completion.choices[0].message.content or "{}"
+    data = safe_json_loads(raw)
+
+    return {
+        "vin": vin,
+        "year": str(data.get("year", "unknown")),
+        "make": str(data.get("make", "unknown")),
+        "model": str(data.get("model", "unknown")),
+        "body_style": str(data.get("body_style", "unknown")),
+    }
+
+# ============================================================
+# PRE-SCAN (multi-image "fusion" + left/right fix)
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
 You are an automotive DAMAGE PRE-SCAN AI.
 
+You will be given between 1 and 3 photos of a vehicle for a collision center.
+
 Your job:
-- Look at the photo(s) of a vehicle.
+- Look at ALL photos together and FUSE what you see into ONE combined understanding of the damage.
 - Identify ONLY the panels/areas that clearly show visible damage.
-- Identify ONLY basic damage types.
-- DO NOT guess or invent areas that are not clearly damaged.
+- Identify ONLY basic damage types (scratches, dents, cracks, deformation, etc.).
+- DO NOT guess damage on panels that are not clearly visible or clearly hit.
 
 LEFT/RIGHT RULE (IMPORTANT):
 - Always use the DRIVER'S PERSPECTIVE for left/right (sitting inside the car facing forward).
-- NEVER flip orientation based on camera viewing angle.
-- If the angle makes it hard to be 100% sure, you can say “front-left (likely)” or “front-right (likely)” in NOTES,
-  but the AREAS list must still use the correct left/right labels.
-- DO NOT label damage as right-side if it is actually on the left, or vice versa.
+- NEVER flip orientation based on camera angle.
+- If angle is ambiguous, you may say “front-left (likely)” or “front-right (likely)” in NOTES,
+  but the AREAS list must still use standard panel names (e.g. "front left fender").
 
-ORIENTATION STEP:
-Before listing damage, briefly describe the photo angle:
-Examples:
-- “Photo appears taken from the front-left of the vehicle.”
-- “Photo taken straight from the front.”
-- “Photo appears taken from the front-right.”
+MULTI-IMAGE FUSION:
+- Some damage may be more obvious in one photo than another (e.g., hood buckling in one picture, bumper damage in another).
+- Combine evidence across ALL photos before deciding which panels are damaged.
+- If multiple angles confirm a single impact zone (e.g., front-left hit across bumper, fender, hood),
+  reflect that continuity in the AREAS list.
 
 FORMAT TO USE:
 
 ORIENTATION:
-- one sentence about camera angle
+- one sentence about the overall camera angles used (e.g. "Photos from front-left and straight-on.")
 
 AREAS:
 - front left fender
 - front bumper upper
-- right headlight
+- hood
+- left headlight
 
 DAMAGE TYPES:
 - deep dent
-- dent
 - panel deformation
 - crack
+- paint scuff
 
 NOTES:
-- short comments about what you see, plus any possible suspension/structural concerns
+- short comments about what you see, mention any possible suspension/structural concerns, and any "likely" orientation decisions.
 """.strip()
 
-# ============================================================
-# Run PRE-SCAN
-# ============================================================
 
 def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     if not image_data_urls:
@@ -247,10 +324,12 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     content: List[dict] = [
         {
             "type": "text",
-            "text": f"Customer photos for {shop.name}. Follow the PRE-SCAN instructions exactly.",
+            "text": (
+                f"Customer photos for {shop.name}. "
+                "Follow the PRE-SCAN instructions exactly and fuse observations across ALL photos."
+            ),
         }
     ]
-
     for url in image_data_urls[:3]:
         content.append({"type": "image_url", "image_url": {"url": url}})
 
@@ -262,12 +341,12 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
             {"role": "user", "content": content},
         ],
     )
-
     raw = completion.choices[0].message.content or ""
 
     areas = clean_areas_from_text(raw)
     damage_types = clean_damage_types_from_text(raw)
 
+    # Extract NOTES block if present
     notes = ""
     m = re.search(r"NOTES:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
     if m:
@@ -281,47 +360,56 @@ def run_pre_scan(image_data_urls: List[str], shop: Shop) -> Dict[str, Any]:
     }
 
 
-def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any]) -> str:
+def build_pre_scan_sms(shop: Shop, pre: Dict[str, Any], vin_info: Optional[Dict[str, str]] = None) -> str:
     areas = pre.get("areas", [])
     damage_types = pre.get("damage_types", [])
     notes = pre.get("notes", "") or ""
 
-    msg: List[str] = [f"AI Pre-Scan for {shop.name}", ""]
+    lines: List[str] = [f"AI Pre-Scan for {shop.name}", ""]
+
+    if vin_info and vin_info.get("vin"):
+        lines.append(
+            f"Vehicle (from VIN): {vin_info.get('year', 'unknown')} "
+            f"{vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')}"
+        )
+        lines.append("")
 
     if areas:
-        msg.append("Here's what I can clearly see from your photo(s):")
+        lines.append("From your photo(s), I can clearly see damage on:")
         for a in areas:
-            msg.append(f"- {a}")
+            lines.append(f"- {a}")
     else:
-        msg.append(
-            "I couldn't confidently pick out specific damaged panels yet from this angle."
+        lines.append(
+            "I couldn't confidently pick out specific damaged panels yet from these angles."
         )
 
     if damage_types:
-        msg.append("")
-        msg.append("Damage types I can see:")
-        msg.append("- " + ", ".join(damage_types))
+        lines.append("")
+        lines.append("Damage types I can see:")
+        lines.append("- " + ", ".join(damage_types))
 
     if notes:
-        msg.append("")
-        msg.append("Notes:")
-        msg.append(notes)
+        lines.append("")
+        lines.append("Notes:")
+        lines.append(notes)
 
-    msg.append("")
-    msg.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
-    msg.append("If it's off, reply 2 and you can send clearer / wider photos.")
+    lines.append("")
+    lines.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
+    lines.append("If it's off, reply 2 and you can send clearer / wider photos.")
+    lines.append("")
+    lines.append("Optional: you can also text your 17-character VIN to decode your vehicle details.")
 
-    return "\n".join(msg)
+    return "\n".join(lines)
 
 # ============================================================
-# ESTIMATE SYSTEM PROMPT
+# ESTIMATE + line-item breakdown (Audatex-style)
 # ============================================================
 
 ESTIMATE_SYSTEM_PROMPT = """
 You are an experienced collision estimator in Ontario, Canada (year 2025).
 
 You receive:
-- CONFIRMED damaged areas (only from the photo-based pre-scan).
+- CONFIRMED damaged areas (from a photo-based pre-scan).
 - CONFIRMED basic damage types.
 - Optional notes (for example: “hood is heavily dented and deformed on the left side.”).
 
@@ -329,7 +417,8 @@ Your tasks:
 1) Classify severity: "minor", "moderate", "severe", or "unknown".
 2) Provide a realistic repair cost range in CAD (min_cost, max_cost) for labour + materials.
 3) Write a short, customer-friendly explanation (2–4 sentences).
-4) Include a brief disclaimer that this is a visual preliminary estimate only.
+4) Produce a simple Audatex-style line-item breakdown (operations, hours, parts).
+5) Include a brief disclaimer that this is a visual preliminary estimate only.
 
 Severity guidance:
 - Crushed, heavily dented, caved-in, or clearly deformed panels on structural areas (trunk, hood, bumpers, quarter panels, roof)
@@ -341,20 +430,31 @@ STRICT RULES:
 - NEVER add new panels or areas beyond those given.
 - If confirmed areas list is empty, set severity to "unknown" and keep cost very low or 0–200.
 
-Output JSON ONLY in this exact schema:
+Line items:
+- Use generic operations like "R&R", "Repair", "Refinish", "Blend", "R&I".
+- Use rough labour hours (e.g. 0.5, 1.2, 2.0).
+- Use placeholder part descriptions like "Fender OEM part" or "Bumper cover (aftermarket)" without prices.
+- Keep the total number of line items small (max 8–10) so it fits in an SMS.
+
+OUTPUT JSON ONLY IN THIS EXACT SCHEMA:
 
 {
   "severity": "minor | moderate | severe | unknown",
   "min_cost": 0,
   "max_cost": 0,
   "summary": "2–4 sentence explanation.",
-  "disclaimer": "Short note reminding it's a visual estimate only."
+  "disclaimer": "Short note reminding it's a visual estimate only.",
+  "line_items": [
+    {
+      "panel": "front left fender",
+      "operation": "R&R",
+      "hours": 2.5,
+      "notes": "Remove and replace damaged fender."
+    }
+  ]
 }
 """.strip()
 
-# ============================================================
-# Run ESTIMATE + sanity adjustments
-# ============================================================
 
 def run_estimate(
     shop: Shop,
@@ -377,15 +477,9 @@ def run_estimate(
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": json.dumps(payload)},
-                ],
-            },
+            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload)}]},
         ],
     )
-
     raw = completion.choices[0].message.content or "{}"
     data = safe_json_loads(raw)
 
@@ -393,38 +487,41 @@ def run_estimate(
     if severity not in {"minor", "moderate", "severe", "unknown"}:
         severity = "unknown"
 
-    def _float(val, default=0.0) -> float:
+    def _f(v, default=0.0) -> float:
         try:
-            return float(val)
+            return float(v)
         except (TypeError, ValueError):
             return float(default)
 
     estimate = {
         "severity": severity,
-        "min_cost": _float(data.get("min_cost", 0)),
-        "max_cost": _float(data.get("max_cost", 0)),
+        "min_cost": _f(data.get("min_cost", 0)),
+        "max_cost": _f(data.get("max_cost", 0)),
         "summary": str(data.get("summary", "")).strip(),
         "disclaimer": str(data.get("disclaimer", "")).strip(),
+        "line_items": data.get("line_items", []) or [],
     }
 
-    return sanity_adjust_estimate(estimate, areas, damage_types, notes)
+    return sanity_adjust_estimate(shop, estimate, areas, damage_types, notes)
 
 
 def sanity_adjust_estimate(
+    shop: Shop,
     estimate: Dict[str, Any],
     areas: List[str],
     damage_types: List[str],
     notes: str = "",
 ) -> Dict[str, Any]:
     severity = estimate.get("severity", "unknown").lower()
-    def _float(val, default=0.0) -> float:
+
+    def _f(v, default=0.0) -> float:
         try:
-            return float(val)
+            return float(v)
         except (TypeError, ValueError):
             return float(default)
 
-    min_cost = _float(estimate.get("min_cost", 0))
-    max_cost = _float(estimate.get("max_cost", 0))
+    min_cost = _f(estimate.get("min_cost", 0))
+    max_cost = _f(estimate.get("max_cost", 0))
 
     lowered_areas = [a.lower() for a in areas]
     lowered_types = [d.lower() for d in damage_types]
@@ -496,26 +593,42 @@ def sanity_adjust_estimate(
 
     severity = rank_to_label.get(current_rank, severity)
 
-    # 4) Guardrails on cost
-    if severity == "minor":
-        if min_cost <= 0:
-            min_cost = 150
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 600
-        max_cost = min(max_cost, 2000)
-    elif severity == "moderate":
-        if min_cost <= 0:
-            min_cost = 600
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 2500
-    elif severity == "severe":
-        if min_cost <= 0:
-            min_cost = 2000
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 6000
-    else:  # unknown
-        if min_cost <= 0 and max_cost <= 0:
-            min_cost, max_cost = 0, 200
+    # 4) Shop-specific pricing if available
+    pricing = shop.pricing
+    if pricing:
+        if severity == "minor":
+            min_cost = max(min_cost, pricing.minor_min)
+            max_cost = max(max_cost, pricing.minor_max)
+        elif severity == "moderate":
+            min_cost = max(min_cost, pricing.moderate_min)
+            max_cost = max(max_cost, pricing.moderate_max)
+        elif severity == "severe":
+            min_cost = max(min_cost, pricing.severe_min)
+            max_cost = max(max_cost, pricing.severe_max)
+        else:  # unknown
+            if min_cost <= 0 and max_cost <= 0:
+                min_cost, max_cost = 0, 200
+    else:
+        # generic guardrails
+        if severity == "minor":
+            if min_cost <= 0:
+                min_cost = 150
+            if max_cost <= 0 or max_cost < min_cost:
+                max_cost = min_cost + 600
+            max_cost = min(max_cost, 2000)
+        elif severity == "moderate":
+            if min_cost <= 0:
+                min_cost = 600
+            if max_cost <= 0 or max_cost < min_cost:
+                max_cost = min_cost + 2500
+        elif severity == "severe":
+            if min_cost <= 0:
+                min_cost = 2000
+            if max_cost <= 0 or max_cost < min_cost:
+                max_cost = min_cost + 6000
+        else:  # unknown
+            if min_cost <= 0 and max_cost <= 0:
+                min_cost, max_cost = 0, 200
 
     if max_cost < min_cost:
         max_cost = min_cost
@@ -529,12 +642,64 @@ def sanity_adjust_estimate(
     estimate["max_cost"] = max_cost
     return estimate
 
+# ============================================================
+# AI explanation text (customer-friendly damage explainer)
+# ============================================================
+
+EXPLANATION_SYSTEM_PROMPT = """
+You are a service advisor at an auto body shop.
+
+You receive:
+- A list of damaged areas.
+- A list of damage types.
+- A short summary and severity from a previous AI estimate.
+
+Write a short, very clear explanation (2–4 sentences) that:
+- Explains WHAT is damaged, panel by panel.
+- Explains in simple terms why the severity is minor/moderate/severe.
+- Does NOT talk about pricing or dollars (that is already handled elsewhere).
+- Sounds friendly and professional.
+
+Return plain text only (no JSON, no bullet points).
+""".strip()
+
+
+def build_explanation_text(
+    areas: List[str],
+    damage_types: List[str],
+    estimate: Dict[str, Any],
+) -> str:
+    if not areas and not damage_types:
+        return ""
+
+    payload = {
+        "areas": areas,
+        "damage_types": damage_types,
+        "severity": estimate.get("severity", "unknown"),
+        "summary": estimate.get("summary", ""),
+    }
+
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
+            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload)}]},
+        ],
+    )
+    text = completion.choices[0].message.content or ""
+    return text.strip()
+
+# ============================================================
+# Build SMS with line-items + explanation
+# ============================================================
 
 def build_estimate_sms(
     shop: Shop,
     areas: List[str],
     damage_types: List[str],
     estimate: Dict[str, Any],
+    vin_info: Optional[Dict[str, str]] = None,
 ) -> str:
     severity = estimate.get("severity", "unknown").capitalize()
     min_cost = int(estimate.get("min_cost", 0) or 0)
@@ -543,6 +708,9 @@ def build_estimate_sms(
     disclaimer = estimate.get("disclaimer") or (
         "This is a visual pre-estimate only. Final pricing may change after in-person inspection."
     )
+    line_items = estimate.get("line_items") or []
+
+    explanation = build_explanation_text(areas, damage_types, estimate)
 
     estimate_id = str(uuid.uuid4())
     areas_str = ", ".join(areas) if areas else "not clearly identified yet"
@@ -551,25 +719,147 @@ def build_estimate_sms(
     lines: List[str] = [
         f"AI Damage Estimate for {shop.name}",
         "",
-        f"Severity: {severity}",
-        f"Estimated Cost (Ontario 2025): ${min_cost:,} – ${max_cost:,}",
-        f"Areas: {areas_str}",
-        f"Damage Types: {dmg_str}",
     ]
+
+    if vin_info and vin_info.get("vin"):
+        lines.append(
+            f"Vehicle: {vin_info.get('year', 'unknown')} "
+            f"{vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')}"
+        )
+        lines.append("")
+
+    lines.extend(
+        [
+            f"Severity: {severity}",
+            f"Estimated Cost (Ontario 2025): ${min_cost:,} – ${max_cost:,}",
+            f"Areas: {areas_str}",
+            f"Damage Types: {dmg_str}",
+        ]
+    )
 
     if summary:
         lines.append("")
         lines.append(summary)
+
+    # Line-item preview (compressed)
+    if line_items:
+        lines.append("")
+        lines.append("Line-item breakdown:")
+        for item in line_items[:6]:  # limit for SMS length
+            panel = item.get("panel", "panel")
+            op = item.get("operation", "operation")
+            hrs = item.get("hours", 0)
+            lines.append(f"- {panel}: {op} (~{hrs} hrs)")
+
+    if explanation:
+        lines.append("")
+        lines.append("Damage overview:")
+        lines.append(explanation)
 
     lines.append("")
     lines.append(f"Estimate ID (internal): {estimate_id}")
     lines.append("")
     lines.append(disclaimer)
 
+    lines.append("")
+    lines.append("To book a repair appointment, reply:")
+    lines.append('BOOK; Full Name; email@example.com; 2025-12-01 10:30')
+
     return "\n".join(lines)
 
 # ============================================================
-# Twilio webhook (2-step flow)
+# Google Calendar integration (optional, service account)
+# ============================================================
+
+def create_calendar_event_for_booking(
+    shop: Shop,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: str,
+    appt_start_iso: str,
+    session: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """
+    Creates a Google Calendar event if Google libraries + credentials are configured.
+    Returns (success, message).
+    """
+    # If no calendar configured for this shop, do nothing
+    calendar_id = shop.calendar_id or os.getenv("GOOGLE_CALENDAR_ID")
+    if not calendar_id:
+        return False, "Calendar ID not configured."
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except ImportError:
+        return False, "Google Calendar libraries not installed."
+
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json:
+        return False, "Google service account JSON not configured."
+
+    try:
+        info = json.loads(service_account_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/calendar"],
+        )
+        service = build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        return False, f"Failed to init Calendar client: {e}"
+
+    # Build event body
+    start_dt = datetime.fromisoformat(appt_start_iso)
+    end_dt = start_dt + timedelta(hours=1)
+
+    vin_info = session.get("vin_info") or {}
+    estimate = session.get("last_estimate") or {}
+    areas = session.get("areas") or []
+    damage_types = session.get("damage_types") or []
+
+    description_lines = [
+        f"Customer: {customer_name}",
+        f"Phone: {customer_phone}",
+        f"Email: {customer_email}",
+        "",
+    ]
+    if vin_info.get("vin"):
+        description_lines.append(
+            f"Vehicle VIN: {vin_info.get('vin')} "
+            f"({vin_info.get('year', 'unknown')} {vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')})"
+        )
+        description_lines.append("")
+    if areas:
+        description_lines.append("Damaged areas:")
+        for a in areas:
+            description_lines.append(f"- {a}")
+    if damage_types:
+        description_lines.append("")
+        description_lines.append("Damage types:")
+        description_lines.append(", ".join(damage_types))
+    if estimate:
+        description_lines.append("")
+        description_lines.append(
+            f"AI Estimated Severity: {estimate.get('severity', 'unknown')} "
+            f"Cost: ${estimate.get('min_cost', 0)}–${estimate.get('max_cost', 0)}"
+        )
+
+    event = {
+        "summary": f"Repair booking - {customer_name}",
+        "description": "\n".join(description_lines),
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Toronto"},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": "America/Toronto"},
+        "attendees": [{"email": customer_email}],
+    }
+
+    try:
+        service.events().insert(calendarId=calendar_id, body=event).execute()
+        return True, "Booking added to calendar."
+    except Exception as e:
+        return False, f"Failed to create calendar event: {e}"
+
+# ============================================================
+# Twilio webhook (MMS + VIN + estimate + booking)
 # ============================================================
 
 @app.post("/sms-webhook")
@@ -598,9 +888,10 @@ async def sms_webhook(request: Request):
 
         cleanup_sessions()
         key = session_key(shop, from_number)
+        session = SESSIONS.get(key) or {}
         lower_body = body.lower()
 
-        # CASE 1 – MMS received: run PRE-SCAN
+        # CASE A: Incoming MMS with photos -> run PRE-SCAN
         if num_media > 0:
             image_data_urls: List[str] = []
 
@@ -637,22 +928,25 @@ async def sms_webhook(request: Request):
                     )
                     return Response(content=str(reply), media_type="application/xml")
 
-                SESSIONS[key] = {
-                    "areas": pre_scan.get("areas", []),
-                    "damage_types": pre_scan.get("damage_types", []),
-                    "notes": pre_scan.get("notes", ""),
-                    "raw": pre_scan.get("raw", ""),
-                    "created_at": datetime.utcnow(),
-                }
+                session.update(
+                    {
+                        "areas": pre_scan.get("areas", []),
+                        "damage_types": pre_scan.get("damage_types", []),
+                        "notes": pre_scan.get("notes", ""),
+                        "raw_pre_scan": pre_scan.get("raw", ""),
+                        "created_at": datetime.utcnow(),
+                    }
+                )
+                SESSIONS[key] = session
 
-                reply.message(build_pre_scan_sms(shop, pre_scan))
+                vin_info = session.get("vin_info")
+                reply.message(build_pre_scan_sms(shop, pre_scan, vin_info))
 
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE 2 – Customer replies 1 (confirm pre-scan)
+        # CASE B: Reply 1 -> confirm pre-scan, send estimate
         if lower_body in {"1", "yes", "y"}:
-            session = SESSIONS.get(key)
-            if not session:
+            if not session.get("areas") and not session.get("damage_types"):
                 reply.message(
                     "I don't see a recent photo for this number. "
                     "Please send 1–3 clear photos of the damaged area to start a new estimate."
@@ -666,11 +960,15 @@ async def sms_webhook(request: Request):
                     session.get("damage_types", []),
                     session.get("notes", ""),
                 )
+                session["last_estimate"] = estimate
+                SESSIONS[key] = session
+
                 text = build_estimate_sms(
                     shop,
                     session.get("areas", []),
                     session.get("damage_types", []),
                     estimate,
+                    vin_info=session.get("vin_info"),
                 )
             except Exception:
                 text = (
@@ -678,11 +976,10 @@ async def sms_webhook(request: Request):
                     "Please resend the photos to start again."
                 )
 
-            SESSIONS.pop(key, None)
             reply.message(text)
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE 3 – Customer replies 2 (pre-scan is wrong)
+        # CASE C: Reply 2 -> pre-scan wrong, ask for new photos
         if lower_body in {"2", "no", "n"}:
             SESSIONS.pop(key, None)
             reply.message(
@@ -691,15 +988,87 @@ async def sms_webhook(request: Request):
             )
             return Response(content=str(reply), media_type="application/xml")
 
-        # CASE 4 – Default instructions
+        # CASE D: VIN message (standalone 17-char VIN)
+        stripped = body.replace(" ", "").upper()
+        if len(stripped) == 17 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", stripped):
+            vin_info = decode_vin_with_ai(stripped)
+            session["vin_info"] = vin_info
+            if "created_at" not in session:
+                session["created_at"] = datetime.utcnow()
+            SESSIONS[key] = session
+
+            msg = [
+                "VIN decoded:",
+                f"VIN: {vin_info.get('vin')}",
+                f"Year: {vin_info.get('year')}",
+                f"Make: {vin_info.get('make')}",
+                f"Model: {vin_info.get('model')}",
+            ]
+            reply.message("\n".join(msg))
+            return Response(content=str(reply), media_type="application/xml")
+
+        # CASE E: Booking request: "BOOK; Name; email; 2025-12-01 10:30"
+        if lower_body.startswith("book"):
+            parts = [p.strip() for p in body.split(";")]
+            if len(parts) < 4:
+                reply.message(
+                    "To book, please reply using this format:\n"
+                    "BOOK; Full Name; email@example.com; 2025-12-01 10:30"
+                )
+                return Response(content=str(reply), media_type="application/xml")
+
+            _, full_name, email, dt_str = parts[0], parts[1], parts[2], parts[3]
+            full_name = full_name.strip()
+            email = email.strip()
+            dt_str = dt_str.strip()
+
+            try:
+                # parse naive local time in America/Toronto
+                appt_dt = datetime.fromisoformat(dt_str)
+                appt_iso = appt_dt.isoformat()
+            except Exception:
+                reply.message(
+                    "I couldn't read that date/time. Please use this format:\n"
+                    "BOOK; Full Name; email@example.com; 2025-12-01 10:30"
+                )
+                return Response(content=str(reply), media_type="application/xml")
+
+            success, msg = create_calendar_event_for_booking(
+                shop,
+                customer_name=full_name,
+                customer_email=email,
+                customer_phone=from_number,
+                appt_start_iso=appt_iso,
+                session=session,
+            )
+
+            if success:
+                reply.message(
+                    "Your repair appointment request has been booked. "
+                    "The shop will contact you if any changes are needed.\n\n" + msg
+                )
+            else:
+                reply.message(
+                    "I saved your booking details, but couldn't add it to the calendar automatically:\n"
+                    f"{msg}\n\nThe shop will follow up to confirm your time."
+                )
+
+            # keep session data for reference
+            SESSIONS[key] = session
+            return Response(content=str(reply), media_type="application/xml")
+
+        # CASE F: Default instructions (no photos, not 1/2, not VIN, not BOOK)
         instructions = (
             f"Hi from {shop.name}!\n\n"
             "To get an AI-powered damage estimate:\n"
             "1) Send 1–3 clear photos of the damaged area.\n"
-            "2) I’ll send a quick Pre-Scan.\n"
+            "2) I’ll send a quick AI Pre-Scan.\n"
             "3) Reply 1 if it looks right, or 2 if it’s off.\n"
             "4) Then I'll send your full Ontario 2025 cost estimate.\n\n"
-            "You can start by sending photos now."
+            "Optional:\n"
+            "- Text your 17-character VIN to decode your vehicle details.\n"
+            "- After your estimate, book a repair by replying:\n"
+            "  BOOK; Full Name; email@example.com; 2025-12-01 10:30"
         )
         reply.message(instructions)
         return Response(content=str(reply), media_type="application/xml")
@@ -727,6 +1096,8 @@ async def list_shops():
                 "id": shop.id,
                 "name": shop.name,
                 "webhook_token": shop.webhook_token,
+                "calendar_id": shop.calendar_id,
+                "pricing": shop.pricing.dict() if shop.pricing else None,
                 "twilio_webhook_example": webhook,
             }
         )
@@ -738,4 +1109,4 @@ async def list_shops():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Multi-shop AI damage estimator is running"}
+    return {"status": "ok", "message": "Multi-shop AI damage estimator with fusion, VIN & booking is running"}
