@@ -4,7 +4,7 @@ import re
 import base64
 import uuid
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
@@ -14,6 +14,9 @@ from pydantic import BaseModel
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
+# Natural-language datetime parsing
+from dateutil import parser as date_parser
+
 # ===========================
 # SQLAlchemy (PostgreSQL ONLY)
 # ===========================
@@ -22,7 +25,6 @@ from sqlalchemy import (
     Column,
     String,
     Integer,
-    Float,
     DateTime,
     Text,
     JSON,
@@ -241,12 +243,25 @@ class ShopPricing(BaseModel):
     severe_max: float = 6000.0
 
 
+# Default hours for all shops (your schedule)
+DEFAULT_HOURS: Dict[str, List[str]] = {
+    "mon": ["09:00", "17:00"],
+    "tue": ["09:00", "17:00"],
+    "wed": ["09:00", "19:00"],
+    "thu": ["09:00", "19:00"],
+    "fri": ["09:00", "19:00"],
+    "sat": ["09:00", "17:00"],
+    "sun": [],  # CLOSED
+}
+
+
 class Shop(BaseModel):
     id: str
     name: str
     webhook_token: str  # used as ?token=... in Twilio URL
     calendar_id: Optional[str] = None  # optional Google Calendar ID
     pricing: Optional[ShopPricing] = None  # optional custom pricing
+    hours: Optional[Dict[str, List[str]]] = None  # business hours per day
 
 
 def load_shops() -> Dict[str, Shop]:
@@ -256,6 +271,7 @@ def load_shops() -> Dict[str, Shop]:
             id="default",
             name="Auto Body Shop",
             webhook_token="demo_token",
+            hours=DEFAULT_HOURS,
         )
         return {default.webhook_token: default}
 
@@ -268,12 +284,16 @@ def load_shops() -> Dict[str, Shop]:
                 pricing_obj = ShopPricing(**item["pricing"])
             except Exception:
                 pricing_obj = None
+
+        hours = item.get("hours") or DEFAULT_HOURS
+
         shop = Shop(
             id=item.get("id", "unknown"),
             name=item.get("name", "Auto Body Shop"),
             webhook_token=item["webhook_token"],
             calendar_id=item.get("calendar_id"),
             pricing=pricing_obj,
+            hours=hours,
         )
         by_token[shop.webhook_token] = shop
     return by_token
@@ -965,7 +985,7 @@ def build_estimate_sms(
 
     lines.append("")
     lines.append("To book a repair appointment, reply:")
-    lines.append('BOOK; Full Name; email@example.com; 2025-12-01 10:30')
+    lines.append("Book Full Name, email@example.com, Nov 28 9am")
 
     return "\n".join(lines)
 
@@ -978,7 +998,7 @@ def create_calendar_event_for_booking(
     customer_name: str,
     customer_email: str,
     customer_phone: str,
-    appt_start_iso: str,
+    appt_start: datetime,
     session: Dict[str, Any],
 ) -> Tuple[bool, str, Optional[str]]:
     calendar_id = shop.calendar_id or os.getenv("GOOGLE_CALENDAR_ID")
@@ -1005,13 +1025,15 @@ def create_calendar_event_for_booking(
     except Exception as e:
         return False, f"Failed to init Calendar client: {e}", None
 
-    start_dt = datetime.fromisoformat(appt_start_iso)
-    end_dt = start_dt + timedelta(hours=1)
+    # appt_start is naive local (America/Toronto)
+    start_dt = appt_start
+    end_dt = appt_start + timedelta(hours=1)
 
     vin_info = session.get("vin_info") or {}
     estimate = session.get("last_estimate") or {}
     areas = session.get("areas") or []
     damage_types = session.get("damage_types") or []
+    photo_links = session.get("photo_links") or []
 
     description_lines = [
         f"Customer: {customer_name}",
@@ -1019,6 +1041,13 @@ def create_calendar_event_for_booking(
         f"Email: {customer_email}",
         "",
     ]
+
+    if photo_links:
+        description_lines.append("Photo links (Twilio):")
+        for url in photo_links:
+            description_lines.append(url)
+        description_lines.append("")
+
     if vin_info.get("vin"):
         description_lines.append(
             f"Vehicle VIN: {vin_info.get('vin')} "
@@ -1056,6 +1085,85 @@ def create_calendar_event_for_booking(
         return False, f"Failed to create calendar event: {e}", None
 
 # ============================================================
+# Booking helpers: hours + availability + suggestions
+# ============================================================
+
+APPOINTMENT_DURATION_HOURS = 1
+MIN_LEAD_MINUTES = 60  # at least 1 hour in advance
+
+
+def parse_appointment_datetime(text: str) -> datetime:
+    """
+    Parse natural language date/time like 'Nov 28 9am', '2025-11-28 09:00',
+    'tomorrow at 3pm', etc. Returns naive datetime (local).
+    """
+    dt = date_parser.parse(text, fuzzy=True)
+    # Treat as local naive (America/Toronto) without tzinfo
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def get_shop_hours_for_day(shop: Shop, dt: datetime) -> Optional[Tuple[time, time]]:
+    day_keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    key = day_keys[dt.weekday()]
+    hours_cfg = (shop.hours or DEFAULT_HOURS).get(key) or []
+    if len(hours_cfg) != 2:
+        return None
+    start_str, end_str = hours_cfg
+    try:
+        start_h = datetime.strptime(start_str, "%H:%M").time()
+        end_h = datetime.strptime(end_str, "%H:%M").time()
+        return start_h, end_h
+    except Exception:
+        return None
+
+
+def is_within_shop_hours(shop: Shop, dt: datetime) -> bool:
+    h = get_shop_hours_for_day(shop, dt)
+    if not h:
+        return False
+    start_h, end_h = h
+    t = dt.time()
+    return start_h <= t < end_h
+
+
+def is_slot_available(db, shop: Shop, dt: datetime) -> bool:
+    start = dt
+    end = dt + timedelta(hours=APPOINTMENT_DURATION_HOURS)
+    existing = (
+        db.query(Booking)
+        .filter(
+            Booking.shop_id == shop.id,
+            Booking.appointment_time >= start,
+            Booking.appointment_time < end,
+        )
+        .all()
+    )
+    return len(existing) == 0
+
+
+def format_slot(dt: datetime) -> str:
+    return dt.strftime("%a %b %d %I:%M%p").replace("AM", "am").replace("PM", "pm")
+
+
+def find_next_available_slots(
+    db, shop: Shop, start_from: datetime, count: int = 3
+) -> List[datetime]:
+    slots: List[datetime] = []
+    cur = start_from
+    end_limit = start_from + timedelta(days=14)
+
+    while cur < end_limit and len(slots) < count:
+        if is_within_shop_hours(shop, cur):
+            if cur > datetime.utcnow() + timedelta(minutes=MIN_LEAD_MINUTES):
+                if is_slot_available(db, shop, cur):
+                    slots.append(cur)
+        cur += timedelta(minutes=30)  # scan every 30 minutes
+
+    return slots
+
+# ============================================================
 # Twilio webhook (MMS + VIN + estimate + booking + DB)
 # ============================================================
 
@@ -1091,12 +1199,15 @@ async def sms_webhook(request: Request):
         # A) Incoming MMS -> PRE-SCAN
         if num_media > 0:
             image_data_urls: List[str] = []
+            media_links: List[str] = []  # store original Twilio media URLs
 
             for i in range(num_media):
                 media_url = form.get(f"MediaUrl{i}")
                 content_type = form.get(f"MediaContentType{i}") or "image/jpeg"
                 if not media_url:
                     continue
+
+                media_links.append(media_url)  # keep link for calendar
 
                 try:
                     raw = download_twilio_media(media_url)
@@ -1131,6 +1242,7 @@ async def sms_webhook(request: Request):
                         "damage_types": pre_scan.get("damage_types", []),
                         "notes": pre_scan.get("notes", ""),
                         "raw_pre_scan": pre_scan.get("raw", ""),
+                        "photo_links": media_links,  # for calendar
                         "created_at": datetime.utcnow(),
                     }
                 )
@@ -1236,32 +1348,131 @@ async def sms_webhook(request: Request):
             reply.message("\n".join(msg))
             return Response(content=str(reply), media_type="application/xml")
 
-        # E) Booking request: "BOOK; Name; email; 2025-12-01 10:30"
+        # E) Booking request (simplified format):
+        # "Book Full Name, email@example.com, Nov 28 9am"
         if lower_body.startswith("book"):
-            parts = [p.strip() for p in body.split(";")]
-            if len(parts) < 4:
+            # Remove the word "book" and split the rest by comma
+            remainder = body[4:].strip()
+            parts = [p.strip() for p in remainder.split(",") if p.strip()]
+            if len(parts) < 3:
                 reply.message(
-                    "To book, please reply using this format:\n"
-                    "BOOK; Full Name; email@example.com; 2025-12-01 10:30"
+                    "To book, please reply like this:\n"
+                    "Book Full Name, email@example.com, Nov 28 9am"
                 )
                 return Response(content=str(reply), media_type="application/xml")
 
-            _, full_name, email, dt_str = parts[0], parts[1], parts[2], parts[3]
-            full_name = full_name.strip()
-            email = email.strip()
-            dt_str = dt_str.strip()
+            full_name = parts[0]
+            email = parts[1]
+            dt_str = ",".join(parts[2:])  # in case date contains comma
 
             try:
-                appt_dt = datetime.fromisoformat(dt_str)
-                appt_iso = appt_dt.isoformat()
+                appt_dt = parse_appointment_datetime(dt_str)
             except Exception:
                 reply.message(
-                    "I couldn't read that date/time. Please use this format:\n"
-                    "BOOK; Full Name; email@example.com; 2025-12-01 10:30"
+                    "I couldn't read that date/time. Please try something like:\n"
+                    "Book John Smith, john@email.com, Nov 28 9am"
                 )
                 return Response(content=str(reply), media_type="application/xml")
 
+            now_utc = datetime.utcnow()
+            if appt_dt <= now_utc + timedelta(minutes=MIN_LEAD_MINUTES):
+                with db_session() as db:
+                    suggestions = find_next_available_slots(
+                        db, shop, now_utc + timedelta(minutes=MIN_LEAD_MINUTES)
+                    )
+                if suggestions:
+                    lines = [
+                        "That time is too soon or already past.",
+                        "",
+                        "Here are some next available times:",
+                    ]
+                    for s in suggestions:
+                        lines.append(f"- {format_slot(s)}")
+                    lines.append("")
+                    lines.append(
+                        "To book one of these, reply like:\n"
+                        "Book Full Name, email@example.com, Wed Nov 27 3pm"
+                    )
+                    reply.message("\n".join(lines))
+                else:
+                    reply.message(
+                        "That time is too soon or in the past. Please pick a future time during open hours."
+                    )
+                return Response(content=str(reply), media_type="application/xml")
+
+            # Check business hours and availability
             with db_session() as db:
+                hours = get_shop_hours_for_day(shop, appt_dt)
+                if not hours:
+                    # Closed that day
+                    suggestions = find_next_available_slots(db, shop, appt_dt)
+                    lines = [
+                        "The shop is closed at that date/time.",
+                    ]
+                    if suggestions:
+                        lines.append("")
+                        lines.append("Here are some next available times:")
+                        for s in suggestions:
+                            lines.append(f"- {format_slot(s)}")
+                        lines.append("")
+                        lines.append(
+                            "To book one of these, reply like:\n"
+                            "Book Full Name, email@example.com, Thu Nov 28 9am"
+                        )
+                    else:
+                        lines.append(
+                            "Please choose another day during our open hours (Mon–Sat)."
+                        )
+                    reply.message("\n".join(lines))
+                    return Response(content=str(reply), media_type="application/xml")
+
+                if not is_within_shop_hours(shop, appt_dt):
+                    suggestions = find_next_available_slots(db, shop, appt_dt)
+                    lines = [
+                        "That time is outside shop hours.",
+                    ]
+                    if suggestions:
+                        lines.append("")
+                        lines.append("Here are some times within open hours:")
+                        for s in suggestions:
+                            lines.append(f"- {format_slot(s)}")
+                        lines.append("")
+                        lines.append(
+                            "To book one of these, reply like:\n"
+                            "Book Full Name, email@example.com, Fri Nov 29 10am"
+                        )
+                    else:
+                        lines.append(
+                            "Please select a time within our open hours (Mon–Sat)."
+                        )
+                    reply.message("\n".join(lines))
+                    return Response(content=str(reply), media_type="application/xml")
+
+                if not is_slot_available(db, shop, appt_dt):
+                    suggestions = find_next_available_slots(
+                        db, shop, appt_dt + timedelta(minutes=1)
+                    )
+                    lines = [
+                        "That time is already booked.",
+                    ]
+                    if suggestions:
+                        lines.append("")
+                        lines.append("Here are some other available times:")
+                        for s in suggestions:
+                            lines.append(f"- {format_slot(s)}")
+                        lines.append("")
+                        lines.append(
+                            "To book one of these, reply like:\n"
+                            "Book Full Name, email@example.com, Sat Nov 30 11am"
+                        )
+                    else:
+                        lines.append(
+                            "Please choose another time during our open hours (Mon–Sat)."
+                        )
+                    reply.message("\n".join(lines))
+                    return Response(content=str(reply), media_type="application/xml")
+
+                # Slot is valid and free -> save + calendar
                 customer = get_or_create_customer(
                     db, phone=from_number, full_name=full_name, email=email
                 )
@@ -1271,7 +1482,7 @@ async def sms_webhook(request: Request):
                     customer_name=full_name,
                     customer_email=email,
                     customer_phone=from_number,
-                    appt_start_iso=appt_iso,
+                    appt_start=appt_dt,
                     session=session,
                 )
 
@@ -1285,13 +1496,15 @@ async def sms_webhook(request: Request):
 
             if success:
                 reply.message(
-                    "Your repair appointment request has been booked. "
-                    "The shop will contact you if any changes are needed.\n\n" + msg
+                    "Your repair appointment has been booked.\n\n"
+                    f"{msg}\n\n"
+                    f"Time: {format_slot(appt_dt)}"
                 )
             else:
                 reply.message(
                     "I saved your booking details, but couldn't add it to the calendar automatically:\n"
-                    f"{msg}\n\nThe shop will follow up to confirm your time."
+                    f"{msg}\n\nThe shop will follow up to confirm your time.\n\n"
+                    f"Requested time: {format_slot(appt_dt)}"
                 )
 
             SESSIONS[key] = session
@@ -1308,7 +1521,7 @@ async def sms_webhook(request: Request):
             "Optional:\n"
             "- Text your 17-character VIN to decode your vehicle details.\n"
             "- After your estimate, book a repair by replying:\n"
-            "  BOOK; Full Name; email@example.com; 2025-12-01 10:30"
+            "  Book Full Name, email@example.com, Nov 28 9am"
         )
         reply.message(instructions)
         return Response(content=str(reply), media_type="application/xml")
@@ -1342,6 +1555,7 @@ async def list_shops():
                 "webhook_token": shop.webhook_token,
                 "calendar_id": shop.calendar_id,
                 "pricing": shop.pricing.dict() if shop.pricing else None,
+                "hours": shop.hours or DEFAULT_HOURS,
                 "twilio_webhook_example": webhook,
             }
         )
