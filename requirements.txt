@@ -12,3 +12,6 @@ google-auth
 google-auth-httplib2
 google-auth-oauthlib
 python-dateutil
+python-dotenv
+Pillow
+email-validator
