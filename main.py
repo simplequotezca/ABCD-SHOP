@@ -234,13 +234,26 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Multi-shop config (tokenized routing via SHOPS_JSON)
 # ============================================================
 
+class LaborRates(BaseModel):
+    body: float
+    paint: float
+    frame: Optional[float] = None
+
+
+class BaseFloor(BaseModel):
+    minor_min: float
+    minor_max: float
+    moderate_min: float
+    moderate_max: float
+    severe_min: float
+    severe_max: float
+
+
 class ShopPricing(BaseModel):
-    minor_min: float = 150.0
-    minor_max: float = 750.0
-    moderate_min: float = 600.0
-    moderate_max: float = 2500.0
-    severe_min: float = 2000.0
-    severe_max: float = 6000.0
+    labor_rates: LaborRates
+    materials_rate: float = 30.0
+    blend_multiplier: float = 0.5
+    base_floor: BaseFloor
 
 
 # Default hours for all shops (your schedule)
@@ -260,7 +273,7 @@ class Shop(BaseModel):
     name: str
     webhook_token: str  # used as ?token=... in Twilio URL
     calendar_id: Optional[str] = None  # optional Google Calendar ID
-    pricing: Optional[ShopPricing] = None  # optional custom pricing
+    pricing: Optional[ShopPricing] = None  # Level-C pricing
     hours: Optional[Dict[str, List[str]]] = None  # business hours per day
 
 
@@ -282,7 +295,8 @@ def load_shops() -> Dict[str, Shop]:
         if "pricing" in item and isinstance(item["pricing"], dict):
             try:
                 pricing_obj = ShopPricing(**item["pricing"])
-            except Exception:
+            except Exception as e:
+                print("Error parsing pricing for shop:", item.get("id"), repr(e))
                 pricing_obj = None
 
         hours = item.get("hours") or DEFAULT_HOURS
@@ -732,6 +746,175 @@ def run_estimate(
     return sanity_adjust_estimate(shop, estimate, areas, damage_types, notes)
 
 
+# -------- Level-C hours + pricing helpers --------
+
+def _estimate_hours_for_panel(
+    panel: str, damage_types: List[str], severity: str
+) -> Tuple[float, float, float]:
+    """
+    Rough heuristic for body, paint, frame hours per panel.
+    Returns (body_hours, paint_hours, frame_hours).
+    """
+    p = panel.lower()
+    dmg_text = " ".join(damage_types).lower()
+
+    body_hours = 0.0
+    paint_hours = 0.0
+    frame_hours = 0.0
+
+    structural_panels = [
+        "hood",
+        "trunk",
+        "roof",
+        "left quarter panel",
+        "right quarter panel",
+        "front bumper upper",
+        "rear bumper upper",
+        "front bumper lower",
+        "rear bumper lower",
+    ]
+
+    scratch_like = any(
+        k in dmg_text
+        for k in ["scratch", "scuff", "paint transfer", "chip", "curb rash"]
+    )
+    dent_like = any(
+        k in dmg_text for k in ["dent", "dented", "crease", "deformation", "deformed"]
+    )
+    crack_like = any(k in dmg_text for k in ["crack", "hole", "tear"])
+    heavy_like = any(
+        k in dmg_text
+        for k in [
+            "deep dent",
+            "heavy dent",
+            "heavily dented",
+            "heavily deformed",
+            "crushed",
+            "caved in",
+            "buckled",
+            "pushed in",
+            "folded",
+        ]
+    )
+
+    # Wheels / tires: lighter structure work
+    if "wheel" in p or "tire" in p or "rim" in p:
+        if scratch_like:
+            body_hours += 0.4
+            paint_hours += 0.7
+        elif dent_like or crack_like:
+            body_hours += 1.0
+            paint_hours += 1.0
+        return body_hours, paint_hours, frame_hours
+
+    # Base hours by severity
+    if scratch_like and not dent_like and not crack_like:
+        # Cosmetic only
+        if severity == "minor":
+            body_hours += 0.3
+            paint_hours += 0.7
+        elif severity == "moderate":
+            body_hours += 0.5
+            paint_hours += 1.2
+        else:  # severe or unknown
+            body_hours += 0.7
+            paint_hours += 1.5
+    elif dent_like or crack_like:
+        # Real repair
+        if severity == "minor":
+            body_hours += 1.0
+            paint_hours += 1.5
+        elif severity == "moderate":
+            body_hours += 2.0
+            paint_hours += 2.0
+        else:  # severe
+            body_hours += 3.0
+            paint_hours += 2.5
+
+    if crack_like:
+        # Extra work for cracks / holes, especially bumpers
+        body_hours += 0.5
+        paint_hours += 0.5
+
+    if p in structural_panels and heavy_like:
+        # Structural + heavy damage → some frame time
+        frame_hours += 1.0
+        if severity == "severe":
+            frame_hours += 1.0
+
+    return body_hours, paint_hours, frame_hours
+
+
+def _compute_pricing_from_hours(
+    pricing: ShopPricing,
+    areas: List[str],
+    damage_types: List[str],
+    severity: str,
+    notes: str = "",
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Level-C pricing: estimate body/paint/frame hours from panels + damage types,
+    then multiply by labour rates + materials.
+    Returns (total_cost, hours_breakdown).
+    """
+    if not pricing or not pricing.labor_rates:
+        return 0.0, {"body": 0.0, "paint": 0.0, "frame": 0.0}
+
+    body_total = 0.0
+    paint_total = 0.0
+    frame_total = 0.0
+
+    lowered_areas = [a.lower() for a in areas]
+    dmg = [d.lower() for d in damage_types]
+
+    # If nothing is identified, nothing to compute
+    if not lowered_areas:
+        return 0.0, {"body": 0.0, "paint": 0.0, "frame": 0.0}
+
+    for panel in lowered_areas:
+        b, p, f = _estimate_hours_for_panel(panel, dmg, severity)
+        body_total += b
+        paint_total += p
+        frame_total += f
+
+    # If we have multiple panels, add a bit of overlap/complexity
+    if len(lowered_areas) >= 2:
+        body_total *= 1.1
+        paint_total *= 1.05
+
+    # Pull rates
+    body_rate = pricing.labor_rates.body
+    paint_rate = pricing.labor_rates.paint
+    frame_rate = pricing.labor_rates.frame or pricing.labor_rates.body
+
+    labour_cost = (
+        body_total * body_rate
+        + paint_total * paint_rate
+        + frame_total * frame_rate
+    )
+
+    # Materials – one bucket, scaled slightly by severity & #panels
+    materials = pricing.materials_rate
+    if len(lowered_areas) >= 3:
+        materials *= 1.5
+    if severity == "severe":
+        materials *= 1.3
+    elif severity == "moderate":
+        materials *= 1.1
+
+    total_cost = labour_cost + materials
+
+    # Small safety margin
+    total_cost *= 1.05
+
+    hours_info = {
+        "body": round(body_total, 2),
+        "paint": round(paint_total, 2),
+        "frame": round(frame_total, 2),
+    }
+    return total_cost, hours_info
+
+
 def sanity_adjust_estimate(
     shop: Shop,
     estimate: Dict[str, Any],
@@ -758,22 +941,7 @@ def sanity_adjust_estimate(
     tire_like = [a for a in lowered_areas if "tire" in a]
     non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
 
-    # Wheel-only jobs
-    if non_wheel_panels == [] and (wheel_like or tire_like):
-        serious = any(
-            key in " ".join(lowered_types)
-            for key in ["bent wheel", "crack", "deep dent", "hole", "puncture"]
-        )
-        if serious:
-            min_cost = max(min_cost, 250)
-            max_cost = max(max_cost, 700)
-            severity = "moderate"
-        else:
-            min_cost = max(min_cost, 120)
-            max_cost = max(max_cost, 450)
-            severity = "minor"
-
-    # Heavy deformation overrides
+    # Basic severity ranking
     severity_rank = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3}
     rank_to_label = {v: k for k, v in severity_rank.items()}
     current_rank = severity_rank.get(severity, 0)
@@ -809,6 +977,7 @@ def sanity_adjust_estimate(
     ]
     has_structural = any(p in lowered_areas for p in structural_panels)
 
+    # Adjust severity rank based on heavy + structural
     if has_heavy and has_structural:
         current_rank = max(current_rank, severity_rank["severe"])
     elif has_heavy:
@@ -819,42 +988,90 @@ def sanity_adjust_estimate(
         current_rank = max(current_rank, severity_rank["moderate"])
 
     severity = rank_to_label.get(current_rank, severity)
+    estimate["severity"] = severity
 
-    # Shop-specific pricing
     pricing = shop.pricing
-    if pricing:
+
+    # If we have Level-C pricing, use it
+    if pricing and pricing.labor_rates:
+        total_cost, hours_info = _compute_pricing_from_hours(
+            pricing, areas, damage_types, severity, notes
+        )
+
+        if total_cost > 0:
+            # Convert AI suggestion into range around the computed cost
+            base = total_cost
+            min_cost = base * 0.9
+            max_cost = base * 1.2
+
+        # Enforce base floors by severity (shop-specific)
+        floor = pricing.base_floor
         if severity == "minor":
-            min_cost = max(min_cost, pricing.minor_min)
-            max_cost = max(max_cost, pricing.minor_max)
+            min_cost = max(min_cost, floor.minor_min)
+            max_cost = max(max_cost, floor.minor_min)
+            max_cost = max(min_cost, min(max_cost, floor.minor_max))
         elif severity == "moderate":
-            min_cost = max(min_cost, pricing.moderate_min)
-            max_cost = max(max_cost, pricing.moderate_max)
+            min_cost = max(min_cost, floor.moderate_min)
+            max_cost = max(max_cost, floor.moderate_min)
+            max_cost = max(min_cost, min(max_cost, floor.moderate_max))
         elif severity == "severe":
-            min_cost = max(min_cost, pricing.severe_min)
-            max_cost = max(max_cost, pricing.severe_max)
+            min_cost = max(min_cost, floor.severe_min)
+            max_cost = max(max_cost, floor.severe_min)
+            max_cost = max(min_cost, min(max_cost, floor.severe_max))
         else:
-            if min_cost <= 0 and max_cost <= 0:
-                min_cost, max_cost = 0, 200
+            # Unknown severity – keep range but at least non-negative
+            min_cost = max(min_cost, 0)
+            max_cost = max(max_cost, min_cost + 100)
+
+        if max_cost < min_cost:
+            max_cost = min_cost
+
+        # Round to nearest $10
+        min_cost = int(round(min_cost / 10.0)) * 10
+        max_cost = int(round(max_cost / 10.0)) * 10
+
+        estimate["min_cost"] = min_cost
+        estimate["max_cost"] = max_cost
+        # Optionally could attach hours_info into line_items or hidden field
+        return estimate
+
+    # ---------- Fallback legacy pricing if no Level-C pricing configured ----------
+
+    # Wheel-only jobs
+    if non_wheel_panels == [] and (wheel_like or tire_like):
+        serious = any(
+            key in " ".join(lowered_types)
+            for key in ["bent wheel", "crack", "deep dent", "hole", "puncture"]
+        )
+        if serious:
+            min_cost = max(min_cost, 250)
+            max_cost = max(max_cost, 700)
+            severity = "moderate"
+        else:
+            min_cost = max(min_cost, 120)
+            max_cost = max(max_cost, 450)
+            severity = "minor"
+
+    # If we still have nothing, fallback by severity only
+    if severity == "minor":
+        if min_cost <= 0:
+            min_cost = 150
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 600
+        max_cost = min(max_cost, 2000)
+    elif severity == "moderate":
+        if min_cost <= 0:
+            min_cost = 600
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 2500
+    elif severity == "severe":
+        if min_cost <= 0:
+            min_cost = 2000
+        if max_cost <= 0 or max_cost < min_cost:
+            max_cost = min_cost + 6000
     else:
-        if severity == "minor":
-            if min_cost <= 0:
-                min_cost = 150
-            if max_cost <= 0 or max_cost < min_cost:
-                max_cost = min_cost + 600
-            max_cost = min(max_cost, 2000)
-        elif severity == "moderate":
-            if min_cost <= 0:
-                min_cost = 600
-            if max_cost <= 0 or max_cost < min_cost:
-                max_cost = min_cost + 2500
-        elif severity == "severe":
-            if min_cost <= 0:
-                min_cost = 2000
-            if max_cost <= 0 or max_cost < min_cost:
-                max_cost = min_cost + 6000
-        else:
-            if min_cost <= 0 and max_cost <= 0:
-                min_cost, max_cost = 0, 200
+        if min_cost <= 0 and max_cost <= 0:
+            min_cost, max_cost = 0, 200
 
     if max_cost < min_cost:
         max_cost = min_cost
@@ -1569,5 +1786,5 @@ async def list_shops():
 async def root():
     return {
         "status": "ok",
-        "message": "AI damage estimator with DB, fusion, VIN & booking is running",
+        "message": "AI damage estimator with Level-C pricing, DB, fusion, VIN & booking is running",
     }
