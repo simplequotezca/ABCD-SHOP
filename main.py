@@ -14,12 +14,8 @@ from pydantic import BaseModel
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
-# Natural-language datetime parsing
 from dateutil import parser as date_parser
 
-# ===========================
-# SQLAlchemy (PostgreSQL ONLY)
-# ===========================
 from sqlalchemy import (
     create_engine,
     Column,
@@ -32,6 +28,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from contextlib import contextmanager
+
+# ============================================================
+# DB SETUP (PostgreSQL)
+# ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -219,7 +219,7 @@ def save_booking_record(
 
 
 # ============================================================
-# FastAPI + OpenAI setup
+# FASTAPI + OPENAI CLIENT
 # ============================================================
 
 app = FastAPI()
@@ -230,8 +230,9 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 # ============================================================
-# Multi-shop config (tokenized routing via SHOPS_JSON)
+# SHOP CONFIG / PRICING
 # ============================================================
 
 class LaborRates(BaseModel):
@@ -256,7 +257,6 @@ class ShopPricing(BaseModel):
     base_floor: BaseFloor
 
 
-# Default hours for all shops (your schedule)
 DEFAULT_HOURS: Dict[str, List[str]] = {
     "mon": ["09:00", "17:00"],
     "tue": ["09:00", "17:00"],
@@ -264,17 +264,17 @@ DEFAULT_HOURS: Dict[str, List[str]] = {
     "thu": ["09:00", "19:00"],
     "fri": ["09:00", "19:00"],
     "sat": ["09:00", "17:00"],
-    "sun": [],  # CLOSED
+    "sun": [],
 }
 
 
 class Shop(BaseModel):
     id: str
     name: str
-    webhook_token: str  # used as ?token=... in Twilio URL
-    calendar_id: Optional[str] = None  # optional Google Calendar ID
-    pricing: Optional[ShopPricing] = None  # Level-C pricing
-    hours: Optional[Dict[str, List[str]]] = None  # business hours per day
+    webhook_token: str
+    calendar_id: Optional[str] = None
+    pricing: Optional[ShopPricing] = None
+    hours: Optional[Dict[str, List[str]]] = None
 
 
 def load_shops() -> Dict[str, Shop]:
@@ -316,7 +316,7 @@ def load_shops() -> Dict[str, Shop]:
 SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
 
 # ============================================================
-# In-memory session store (per shop+phone)
+# IN-MEMORY SESSION STORE
 # ============================================================
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -332,34 +332,55 @@ def cleanup_sessions() -> None:
     expired = []
     for k, v in SESSIONS.items():
         created_at = v.get("created_at")
-        if isinstance(created_at, datetime):
-            if now - created_at > timedelta(minutes=SESSION_TTL_MINUTES):
-                expired.append(k)
+        if isinstance(created_at, datetime) and now - created_at > timedelta(
+            minutes=SESSION_TTL_MINUTES
+        ):
+            expired.append(k)
     for k in expired:
         SESSIONS.pop(k, None)
 
+
 # ============================================================
-# Allowed areas + damage vocab
+# LOOKUP LISTS FOR AREAS + DAMAGE TYPES
 # ============================================================
 
 ALLOWED_AREAS = [
-    "front bumper upper", "front bumper lower",
-    "rear bumper upper", "rear bumper lower",
-    "front left fender", "front right fender",
-    "rear left fender", "rear right fender",
-    "front left door", "front right door",
-    "rear left door", "rear right door",
-    "left quarter panel", "right quarter panel",
-    "hood", "roof", "trunk", "tailgate",
-    "windshield", "rear window",
-    "left windows", "right windows",
-    "left side mirror", "right side mirror",
-    "left headlight", "right headlight",
-    "left taillight", "right taillight",
-    "left front wheel", "right front wheel",
-    "left rear wheel", "right rear wheel",
-    "left front tire", "right front tire",
-    "left rear tire", "right rear tire",
+    "front bumper upper",
+    "front bumper lower",
+    "rear bumper upper",
+    "rear bumper lower",
+    "front left fender",
+    "front right fender",
+    "rear left fender",
+    "rear right fender",
+    "front left door",
+    "front right door",
+    "rear left door",
+    "rear right door",
+    "left quarter panel",
+    "right quarter panel",
+    "hood",
+    "roof",
+    "trunk",
+    "tailgate",
+    "windshield",
+    "rear window",
+    "left windows",
+    "right windows",
+    "left side mirror",
+    "right side mirror",
+    "left headlight",
+    "right headlight",
+    "left taillight",
+    "right taillight",
+    "left front wheel",
+    "right front wheel",
+    "left rear wheel",
+    "right rear wheel",
+    "left front tire",
+    "right front tire",
+    "left rear tire",
+    "right rear tire",
 ]
 
 ALLOWED_DAMAGE_TYPES = [
@@ -428,8 +449,9 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
             pass
     return {}
 
+
 # ============================================================
-# Media download helpers (Twilio)
+# TWILIO MEDIA HELPERS
 # ============================================================
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -448,8 +470,9 @@ def bytes_to_data_url(data: bytes, ctype: str = "image/jpeg") -> str:
     b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{ctype};base64,{b64}"
 
+
 # ============================================================
-# VIN decoding via OpenAI (no external VIN API)
+# VIN DECODER (AI)
 # ============================================================
 
 VIN_SYSTEM_PROMPT = """
@@ -504,8 +527,9 @@ def decode_vin_with_ai(vin: str) -> Dict[str, str]:
         "body_style": str(data.get("body_style", "unknown")),
     }
 
+
 # ============================================================
-# PRE-SCAN (multi-image fusion + left/right fix)
+# PRE-SCAN (MULTI-IMAGE FUSION, DRIVER POV L/R)
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
@@ -641,500 +665,146 @@ def build_pre_scan_sms(
     )
 
     return "\n".join(lines)
-
-# ============================================================
-# ESTIMATE + line-item breakdown (Audatex-style)
+    # ============================================================
+# ESTIMATE SYSTEM (AI) — severity, line items, pricing logic
 # ============================================================
 
 ESTIMATE_SYSTEM_PROMPT = """
 You are an experienced collision estimator in Ontario, Canada (year 2025).
 
 You receive:
-- CONFIRMED damaged areas (from a photo-based pre-scan).
-- CONFIRMED basic damage types.
-- Optional notes (for example: “hood is heavily dented and deformed on the left side.”).
+- CONFIRMED damaged areas (already verified)
+- CONFIRMED damage types (already verified)
+- Optional notes (for example: “hood is heavily dented and deformed on the left side.”)
 
-Your tasks:
-1) Classify severity: "minor", "moderate", "severe", or "unknown".
-2) Provide a realistic repair cost range in CAD (min_cost, max_cost) for labour + materials.
-3) Write a short, customer-friendly explanation (2–4 sentences).
-4) Produce a simple Audatex-style line-item breakdown (operations, hours, parts).
-5) Include a brief disclaimer that this is a visual preliminary estimate only.
+Your job:
+1. Determine SEVERITY: one of ["minor", "moderate", "severe"].
+2. Create LINE ITEMS with parts + labour + paint + materials.
+   Examples:
+      { "panel": "front left fender", "operation": "repair", "hours_body": 2.5, "paint": 1.0 }
+      { "panel": "hood", "operation": "replace", "part_cost": 720, "hours_body": 1.0, "paint": 1.2 }
+3. DO NOT guess hidden damage (frame, suspension, sensors) unless it is VERY visually obvious.
+4. Use conservative but realistic Ontario 2025 estimates.
+5. If crack/split/tear in bumper → usually REPLACE.
+6. If deep dent or deformation on metal panel → usually REPAIR unless severe.
 
-Severity guidance:
-- Crushed, heavily dented, caved-in, or clearly deformed panels on structural areas (trunk, hood, bumpers, quarter panels, roof)
-  are usually "moderate" or "severe", not "minor".
-- Small cosmetic scratches or scuffs on a single panel with no deformation are usually "minor".
-- Multiple damaged panels or combined deformation + cracks typically mean "moderate" or "severe".
-
-STRICT RULES:
-- NEVER add new panels or areas beyond those given.
-- If confirmed areas list is empty, set severity to "unknown" and keep cost very low or 0–200.
-
-Line items:
-- Use generic operations like "R&R", "Repair", "Refinish", "Blend", "R&I".
-- Use rough labour hours (e.g. 0.5, 1.2, 2.0).
-- Use placeholder part descriptions like "Fender OEM part" or "Bumper cover (aftermarket)" without prices.
-- Keep the total number of line items small (max 8–10) so it fits in an SMS.
-
-OUTPUT JSON ONLY IN THIS EXACT SCHEMA:
-
+Respond in strict JSON:
 {
-  "severity": "minor | moderate | severe | unknown",
-  "min_cost": 0,
-  "max_cost": 0,
-  "summary": "2–4 sentence explanation.",
-  "disclaimer": "Short note reminding it's a visual estimate only.",
+  "severity": "minor/moderate/severe",
   "line_items": [
-    {
-      "panel": "front left fender",
-      "operation": "R&R",
-      "hours": 2.5,
-      "notes": "Remove and replace damaged fender."
-    }
+      {
+        "panel": "...",
+        "operation": "repair/replace",
+        "hours_body": number,
+        "paint": number,
+        "part_cost": number or 0
+      }
   ]
 }
 """.strip()
 
 
-def run_estimate(
-    shop: Shop,
-    areas: List[str],
-    damage_types: List[str],
-    notes: str = "",
-) -> Dict[str, Any]:
-    payload = {
-        "shop_name": shop.name,
-        "region": "Ontario",
-        "year": 2025,
-        "confirmed_areas": areas,
+def run_ai_estimator(areas: List[str], damage_types: List[str], notes: str) -> Dict[str, Any]:
+    """Call OpenAI to produce severity + line items."""
+    user_payload = {
+        "damaged_areas": areas,
         "damage_types": damage_types,
-        "pre_scan_notes": notes or "",
+        "notes": notes,
     }
 
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
-        temperature=0,
+        temperature=0.1,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": ESTIMATE_SYSTEM_PROMPT},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload)}]},
+            {"role": "user", "content": json.dumps(user_payload)},
         ],
     )
     raw = completion.choices[0].message.content or "{}"
     data = safe_json_loads(raw)
 
-    severity = (data.get("severity") or "unknown").lower()
-    if severity not in {"minor", "moderate", "severe", "unknown"}:
-        severity = "unknown"
+    severity = data.get("severity", "unknown").lower().strip()
+    if severity not in ["minor", "moderate", "severe"]:
+        severity = "moderate"
 
-    def _f(v, default=0.0) -> float:
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return float(default)
+    line_items = data.get("line_items") or []
+    if not isinstance(line_items, list):
+        line_items = []
 
-    estimate = {
+    return {
         "severity": severity,
-        "min_cost": _f(data.get("min_cost", 0)),
-        "max_cost": _f(data.get("max_cost", 0)),
-        "summary": str(data.get("summary", "")).strip(),
-        "disclaimer": str(data.get("disclaimer", "")).strip(),
-        "line_items": data.get("line_items", []) or [],
+        "line_items": line_items,
     }
 
-    return sanity_adjust_estimate(shop, estimate, areas, damage_types, notes)
 
+# ============================================================
+# LEVEL-C PRICING ENGINE (Shop-specific)
+# ============================================================
 
-# -------- Level-C hours + pricing helpers --------
-
-def _estimate_hours_for_panel(
-    panel: str, damage_types: List[str], severity: str
-) -> Tuple[float, float, float]:
-    """
-    Rough heuristic for body, paint, frame hours per panel.
-    Returns (body_hours, paint_hours, frame_hours).
-    """
-    p = panel.lower()
-    dmg_text = " ".join(damage_types).lower()
-
-    body_hours = 0.0
-    paint_hours = 0.0
-    frame_hours = 0.0
-
-    structural_panels = [
-        "hood",
-        "trunk",
-        "roof",
-        "left quarter panel",
-        "right quarter panel",
-        "front bumper upper",
-        "rear bumper upper",
-        "front bumper lower",
-        "rear bumper lower",
-    ]
-
-    scratch_like = any(
-        k in dmg_text
-        for k in ["scratch", "scuff", "paint transfer", "chip", "curb rash"]
-    )
-    dent_like = any(
-        k in dmg_text for k in ["dent", "dented", "crease", "deformation", "deformed"]
-    )
-    crack_like = any(k in dmg_text for k in ["crack", "hole", "tear"])
-    heavy_like = any(
-        k in dmg_text
-        for k in [
-            "deep dent",
-            "heavy dent",
-            "heavily dented",
-            "heavily deformed",
-            "crushed",
-            "caved in",
-            "buckled",
-            "pushed in",
-            "folded",
-        ]
-    )
-
-    # Wheels / tires: lighter structure work
-    if "wheel" in p or "tire" in p or "rim" in p:
-        if scratch_like:
-            body_hours += 0.4
-            paint_hours += 0.7
-        elif dent_like or crack_like:
-            body_hours += 1.0
-            paint_hours += 1.0
-        return body_hours, paint_hours, frame_hours
-
-    # Base hours by severity
-    if scratch_like and not dent_like and not crack_like:
-        # Cosmetic only
-        if severity == "minor":
-            body_hours += 0.3
-            paint_hours += 0.7
-        elif severity == "moderate":
-            body_hours += 0.5
-            paint_hours += 1.2
-        else:  # severe or unknown
-            body_hours += 0.7
-            paint_hours += 1.5
-    elif dent_like or crack_like:
-        # Real repair
-        if severity == "minor":
-            body_hours += 1.0
-            paint_hours += 1.5
-        elif severity == "moderate":
-            body_hours += 2.0
-            paint_hours += 2.0
-        else:  # severe
-            body_hours += 3.0
-            paint_hours += 2.5
-
-    if crack_like:
-        # Extra work for cracks / holes, especially bumpers
-        body_hours += 0.5
-        paint_hours += 0.5
-
-    if p in structural_panels and heavy_like:
-        # Structural + heavy damage → some frame time
-        frame_hours += 1.0
-        if severity == "severe":
-            frame_hours += 1.0
-
-    return body_hours, paint_hours, frame_hours
-
-
-def _compute_pricing_from_hours(
-    pricing: ShopPricing,
-    areas: List[str],
-    damage_types: List[str],
-    severity: str,
-    notes: str = "",
-) -> Tuple[float, Dict[str, float]]:
-    """
-    Level-C pricing: estimate body/paint/frame hours from panels + damage types,
-    then multiply by labour rates + materials.
-    Returns (total_cost, hours_breakdown).
-    """
-    if not pricing or not pricing.labor_rates:
-        return 0.0, {"body": 0.0, "paint": 0.0, "frame": 0.0}
-
-    body_total = 0.0
-    paint_total = 0.0
-    frame_total = 0.0
-
-    lowered_areas = [a.lower() for a in areas]
-    dmg = [d.lower() for d in damage_types]
-
-    # If nothing is identified, nothing to compute
-    if not lowered_areas:
-        return 0.0, {"body": 0.0, "paint": 0.0, "frame": 0.0}
-
-    for panel in lowered_areas:
-        b, p, f = _estimate_hours_for_panel(panel, dmg, severity)
-        body_total += b
-        paint_total += p
-        frame_total += f
-
-    # If we have multiple panels, add a bit of overlap/complexity
-    if len(lowered_areas) >= 2:
-        body_total *= 1.1
-        paint_total *= 1.05
-
-    # Pull rates
-    body_rate = pricing.labor_rates.body
-    paint_rate = pricing.labor_rates.paint
-    frame_rate = pricing.labor_rates.frame or pricing.labor_rates.body
-
-    labour_cost = (
-        body_total * body_rate
-        + paint_total * paint_rate
-        + frame_total * frame_rate
-    )
-
-    # Materials – one bucket, scaled slightly by severity & #panels
-    materials = pricing.materials_rate
-    if len(lowered_areas) >= 3:
-        materials *= 1.5
-    if severity == "severe":
-        materials *= 1.3
-    elif severity == "moderate":
-        materials *= 1.1
-
-    total_cost = labour_cost + materials
-
-    # Small safety margin
-    total_cost *= 1.05
-
-    hours_info = {
-        "body": round(body_total, 2),
-        "paint": round(paint_total, 2),
-        "frame": round(frame_total, 2),
-    }
-    return total_cost, hours_info
-
-
-def sanity_adjust_estimate(
-    shop: Shop,
-    estimate: Dict[str, Any],
-    areas: List[str],
-    damage_types: List[str],
-    notes: str = "",
+def calculate_costs_with_shop_pricing(
+    shop: Shop, ai_result: Dict[str, Any]
 ) -> Dict[str, Any]:
-    severity = estimate.get("severity", "unknown").lower()
+    """Applies shop-specific labor + materials + part costs + severity floor."""
+    if not shop.pricing:
+        return {
+            "severity": ai_result["severity"],
+            "min_cost": 500,
+            "max_cost": 2000,
+            "line_items": ai_result["line_items"],
+        }
 
-    def _f(v, default=0.0) -> float:
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return float(default)
+    p = shop.pricing
+    lr = p.labor_rates
+    base = p.base_floor
 
-    min_cost = _f(estimate.get("min_cost", 0))
-    max_cost = _f(estimate.get("max_cost", 0))
+    severity = ai_result.get("severity", "moderate")
 
-    lowered_areas = [a.lower() for a in areas]
-    lowered_types = [d.lower() for d in damage_types]
-    notes_text = (notes or "").lower()
-
-    wheel_like = [a for a in lowered_areas if "wheel" in a or "rim" in a]
-    tire_like = [a for a in lowered_areas if "tire" in a]
-    non_wheel_panels = [a for a in lowered_areas if a not in wheel_like + tire_like]
-
-    # Basic severity ranking
-    severity_rank = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3}
-    rank_to_label = {v: k for k, v in severity_rank.items()}
-    current_rank = severity_rank.get(severity, 0)
-
-    heavy_terms = [
-        "heavily dented",
-        "heavy dent",
-        "deep dent",
-        "panel deformation",
-        "bumper deformation",
-        "deformed",
-        "heavily deformed",
-        "crushed",
-        "caved in",
-        "buckled",
-        "pushed in",
-        "folded",
-    ]
-
-    types_text = " ".join(lowered_types)
-    has_heavy = any(term in types_text or term in notes_text for term in heavy_terms)
-
-    structural_panels = [
-        "hood",
-        "trunk",
-        "roof",
-        "left quarter panel",
-        "right quarter panel",
-        "front bumper upper",
-        "front bumper lower",
-        "rear bumper upper",
-        "rear bumper lower",
-    ]
-    has_structural = any(p in lowered_areas for p in structural_panels)
-
-    # Adjust severity rank based on heavy + structural
-    if has_heavy and has_structural:
-        current_rank = max(current_rank, severity_rank["severe"])
-    elif has_heavy:
-        current_rank = max(current_rank, severity_rank["moderate"])
-
-    # Multi-panel heuristic
-    if len(non_wheel_panels) >= 3:
-        current_rank = max(current_rank, severity_rank["moderate"])
-
-    severity = rank_to_label.get(current_rank, severity)
-    estimate["severity"] = severity
-
-    pricing = shop.pricing
-
-    # If we have Level-C pricing, use it
-    if pricing and pricing.labor_rates:
-        total_cost, hours_info = _compute_pricing_from_hours(
-            pricing, areas, damage_types, severity, notes
-        )
-
-        if total_cost > 0:
-            # Convert AI suggestion into range around the computed cost
-            base = total_cost
-            min_cost = base * 0.9
-            max_cost = base * 1.2
-
-        # Enforce base floors by severity (shop-specific)
-        floor = pricing.base_floor
-        if severity == "minor":
-            min_cost = max(min_cost, floor.minor_min)
-            max_cost = max(max_cost, floor.minor_min)
-            max_cost = max(min_cost, min(max_cost, floor.minor_max))
-        elif severity == "moderate":
-            min_cost = max(min_cost, floor.moderate_min)
-            max_cost = max(max_cost, floor.moderate_min)
-            max_cost = max(min_cost, min(max_cost, floor.moderate_max))
-        elif severity == "severe":
-            min_cost = max(min_cost, floor.severe_min)
-            max_cost = max(max_cost, floor.severe_min)
-            max_cost = max(min_cost, min(max_cost, floor.severe_max))
-        else:
-            # Unknown severity – keep range but at least non-negative
-            min_cost = max(min_cost, 0)
-            max_cost = max(max_cost, min_cost + 100)
-
-        if max_cost < min_cost:
-            max_cost = min_cost
-
-        # Round to nearest $10
-        min_cost = int(round(min_cost / 10.0)) * 10
-        max_cost = int(round(max_cost / 10.0)) * 10
-
-        estimate["min_cost"] = min_cost
-        estimate["max_cost"] = max_cost
-        # Optionally could attach hours_info into line_items or hidden field
-        return estimate
-
-    # ---------- Fallback legacy pricing if no Level-C pricing configured ----------
-
-    # Wheel-only jobs
-    if non_wheel_panels == [] and (wheel_like or tire_like):
-        serious = any(
-            key in " ".join(lowered_types)
-            for key in ["bent wheel", "crack", "deep dent", "hole", "puncture"]
-        )
-        if serious:
-            min_cost = max(min_cost, 250)
-            max_cost = max(max_cost, 700)
-            severity = "moderate"
-        else:
-            min_cost = max(min_cost, 120)
-            max_cost = max(max_cost, 450)
-            severity = "minor"
-
-    # If we still have nothing, fallback by severity only
     if severity == "minor":
-        if min_cost <= 0:
-            min_cost = 150
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 600
-        max_cost = min(max_cost, 2000)
+        floor_min, floor_max = base.minor_min, base.minor_max
     elif severity == "moderate":
-        if min_cost <= 0:
-            min_cost = 600
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 2500
-    elif severity == "severe":
-        if min_cost <= 0:
-            min_cost = 2000
-        if max_cost <= 0 or max_cost < min_cost:
-            max_cost = min_cost + 6000
+        floor_min, floor_max = base.moderate_min, base.moderate_max
     else:
-        if min_cost <= 0 and max_cost <= 0:
-            min_cost, max_cost = 0, 200
+        floor_min, floor_max = base.severe_min, base.severe_max
 
-    if max_cost < min_cost:
-        max_cost = min_cost
+    total_min = 0
+    total_max = 0
 
-    # Round to nearest $10
-    min_cost = int(round(min_cost / 10.0)) * 10
-    max_cost = int(round(max_cost / 10.0)) * 10
+    for item in ai_result["line_items"]:
+        hours_body = float(item.get("hours_body") or 0)
+        hours_paint = float(item.get("paint") or 0)
+        part_cost = float(item.get("part_cost") or 0)
 
-    estimate["severity"] = severity
-    estimate["min_cost"] = min_cost
-    estimate["max_cost"] = max_cost
-    return estimate
+        labour_cost = hours_body * lr.body + hours_paint * lr.paint
+        materials = hours_paint * p.materials_rate
 
-# ============================================================
-# AI explanation text
-# ============================================================
+        if part_cost > 0:
+            total_min += labour_cost + materials + part_cost * 0.9
+            total_max += labour_cost + materials + part_cost * 1.1
+        else:
+            total_min += labour_cost + materials
+            total_max += labour_cost + materials
 
-EXPLANATION_SYSTEM_PROMPT = """
-You are a service advisor at an auto body shop.
+    total_min = max(total_min, floor_min)
+    total_max = max(total_max, floor_max)
 
-You receive:
-- A list of damaged areas.
-- A list of damage types.
-- A short summary and severity from a previous AI estimate.
-
-Write a short, very clear explanation (2–4 sentences) that:
-- Explains WHAT is damaged, panel by panel.
-- Explains in simple terms why the severity is minor/moderate/severe.
-- Does NOT talk about pricing or dollars.
-- Sounds friendly and professional.
-
-Return plain text only (no JSON, no bullet points).
-""".strip()
-
-
-def build_explanation_text(
-    areas: List[str],
-    damage_types: List[str],
-    estimate: Dict[str, Any],
-) -> str:
-    if not areas and not damage_types:
-        return ""
-
-    payload = {
-        "areas": areas,
-        "damage_types": damage_types,
-        "severity": estimate.get("severity", "unknown"),
-        "summary": estimate.get("summary", ""),
+    return {
+        "severity": severity,
+        "min_cost": int(total_min),
+        "max_cost": int(total_max),
+        "line_items": ai_result["line_items"],
     }
 
-    completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
-            {"role": "user", "content": [{"type": "text", "text": json.dumps(payload)}]},
-        ],
-    )
-    text = completion.choices[0].message.content or ""
-    return text.strip()
+
+def run_estimate(shop: Shop, areas: List[str], damage_types: List[str], notes: str) -> Dict[str, Any]:
+    """Full estimate pipeline: AI → Level-C pricing."""
+    ai_result = run_ai_estimator(areas, damage_types, notes)
+    priced = calculate_costs_with_shop_pricing(shop, ai_result)
+    return priced
+
 
 # ============================================================
-# Build SMS with line-items + explanation
+# ESTIMATE SMS BUILDER
 # ============================================================
 
 def build_estimate_sms(
@@ -1144,70 +814,163 @@ def build_estimate_sms(
     estimate: Dict[str, Any],
     vin_info: Optional[Dict[str, str]] = None,
 ) -> str:
-    severity = estimate.get("severity", "unknown").capitalize()
-    min_cost = int(estimate.get("min_cost", 0) or 0)
-    max_cost = int(estimate.get("max_cost", 0) or 0)
-    summary = estimate.get("summary") or ""
-    disclaimer = estimate.get("disclaimer") or (
-        "This is a visual pre-estimate only. Final pricing may change after in-person inspection."
-    )
-    line_items = estimate.get("line_items") or []
-
-    explanation = build_explanation_text(areas, damage_types, estimate)
-
-    estimate_id = str(uuid.uuid4())
-    areas_str = ", ".join(areas) if areas else "not clearly identified yet"
-    dmg_str = ", ".join(damage_types) if damage_types else "not clearly classified yet"
-
-    lines: List[str] = [f"AI Damage Estimate for {shop.name}", ""]
+    lines = [f"AI Damage Estimate for {shop.name}", ""]
 
     if vin_info and vin_info.get("vin"):
         lines.append(
-            f"Vehicle: {vin_info.get('year', 'unknown')} "
-            f"{vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')}"
+            f"Vehicle (from VIN): {vin_info.get('year')} "
+            f"{vin_info.get('make')} {vin_info.get('model')}"
         )
         lines.append("")
 
-    lines.extend(
-        [
-            f"Severity: {severity}",
-            f"Estimated Cost (Ontario 2025): ${min_cost:,} – ${max_cost:,}",
-            f"Areas: {areas_str}",
-            f"Damage Types: {dmg_str}",
-        ]
-    )
+    sv = estimate.get("severity", "unknown")
+    min_c = estimate.get("min_cost", 0)
+    max_c = estimate.get("max_cost", 0)
 
-    if summary:
-        lines.append("")
-        lines.append(summary)
+    if sv == "minor":
+        sev_label = "Minor"
+        range_text = f"${min_c} – ${max_c}"
+    elif sv == "moderate":
+        sev_label = "Moderate"
+        range_text = f"${min_c} – ${max_c}"
+    else:
+        sev_label = "Severe"
+        range_text = f"${min_c} – ${max_c}"
 
-    if line_items:
-        lines.append("")
-        lines.append("Line-item breakdown:")
-        for item in line_items[:6]:
-            panel = item.get("panel", "panel")
-            op = item.get("operation", "operation")
-            hrs = item.get("hours", 0)
-            lines.append(f"- {panel}: {op} (~{hrs} hrs)")
-
-    if explanation:
-        lines.append("")
-        lines.append("Damage overview:")
-        lines.append(explanation)
-
+    lines.append(f"Severity: {sev_label}")
+    lines.append(f"Estimated Cost (Ontario 2025): {range_text}")
     lines.append("")
-    lines.append(f"Estimate ID (internal): {estimate_id}")
-    lines.append("")
-    lines.append(disclaimer)
 
-    lines.append("")
-    lines.append("To book a repair appointment, reply:")
-    lines.append("Book Full Name, email@example.com, Nov 28 9am")
+    if areas:
+        lines.append("Areas:")
+        lines.append("- " + ", ".join(areas))
+        lines.append("")
+
+    if damage_types:
+        lines.append("Damage Types:")
+        lines.append("- " + ", ".join(damage_types))
+        lines.append("")
 
     return "\n".join(lines)
+    # ============================================================
+# BOOKING UTILITIES & SCHEDULING LOGIC
+# ============================================================
+
+APPOINTMENT_DURATION_HOURS = 1
+MIN_LEAD_MINUTES = 60  # must be booked at least 1h ahead
+
+
+def parse_appointment_datetime(text: str) -> Optional[datetime]:
+    """Natural-language date/time parser."""
+    try:
+        dt = date_parser.parse(text, fuzzy=True)
+        if dt.tzinfo:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def get_shop_hours_for_day(shop: Shop, dt: datetime) -> Optional[Tuple[time, time]]:
+    """Returns (open, close) for that weekday, or None if closed."""
+    day_keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    key = day_keys[dt.weekday()]
+    hours_cfg = (shop.hours or DEFAULT_HOURS).get(key) or []
+    if len(hours_cfg) != 2:
+        return None
+    try:
+        start = datetime.strptime(hours_cfg[0], "%H:%M").time()
+        end = datetime.strptime(hours_cfg[1], "%H:%M").time()
+        return (start, end)
+    except:
+        return None
+
+
+def is_within_shop_hours(shop: Shop, dt: datetime) -> bool:
+    """Checks if the given datetime occurs during shop business hours."""
+    h = get_shop_hours_for_day(shop, dt)
+    if not h:
+        return False
+    start, end = h
+    return start <= dt.time() < end
+
+
+def is_slot_available(db, shop: Shop, dt: datetime) -> bool:
+    """Check if appointment slot is free."""
+    start = dt
+    end = dt + timedelta(hours=APPOINTMENT_DURATION_HOURS)
+    existing = (
+        db.query(Booking)
+        .filter(
+            Booking.shop_id == shop.id,
+            Booking.appointment_time >= start,
+            Booking.appointment_time < end,
+        )
+        .all()
+    )
+    return len(existing) == 0
+
+
+def format_slot(dt: datetime) -> str:
+    """Friendly text for SMS output."""
+    return dt.strftime("%a %b %d %I:%M%p").replace("AM", "am").replace("PM", "pm")
+
+
+def find_next_available_slots(
+    db, shop: Shop, start_from: datetime, count: int = 3
+) -> List[datetime]:
+    """Finds next few open 30-min slots."""
+    slots = []
+    cur = start_from
+    end_limit = start_from + timedelta(days=14)
+
+    while cur < end_limit and len(slots) < count:
+        if is_within_shop_hours(shop, cur):
+            if cur > datetime.utcnow() + timedelta(minutes=MIN_LEAD_MINUTES):
+                if is_slot_available(db, shop, cur):
+                    slots.append(cur)
+        cur += timedelta(minutes=30)
+
+    return slots
+
 
 # ============================================================
-# Google Calendar integration (optional)
+# BOOKING PARSER UTILITIES (any order)
+# ============================================================
+
+def extract_email(text: str) -> Optional[str]:
+    """Extract an email anywhere in message."""
+    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    return m.group(0) if m else None
+
+
+def extract_name_part(body: str, email: Optional[str]) -> str:
+    """Take everything before email as the name portion."""
+    if not email:
+        return ""
+    name_chunk = body.split(email)[0]
+    name_chunk = (
+        name_chunk.replace("Book", "")
+        .replace("book", "")
+        .replace(",", " ")
+        .strip()
+    )
+    return name_chunk or ""
+
+
+def booking_like_message(body: str, lower_body: str, email: Optional[str], dt: Optional[datetime]) -> bool:
+    """Decide if user intent is booking."""
+    if email:
+        return True
+    if "book" in lower_body:
+        return True
+    if dt:
+        return True
+    return False
+
+
+# ============================================================
+# GOOGLE CALENDAR EVENT CREATION SUPPORT (Part 4 uses this)
 # ============================================================
 
 def create_calendar_event_for_booking(
@@ -1230,7 +993,7 @@ def create_calendar_event_for_booking(
 
     service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not service_account_json:
-        return False, "Google service account JSON not configured.", None
+        return False, "Google service account JSON missing.", None
 
     try:
         info = json.loads(service_account_json)
@@ -1242,7 +1005,6 @@ def create_calendar_event_for_booking(
     except Exception as e:
         return False, f"Failed to init Calendar client: {e}", None
 
-    # appt_start is naive local (America/Toronto)
     start_dt = appt_start
     end_dt = appt_start + timedelta(hours=1)
 
@@ -1252,43 +1014,45 @@ def create_calendar_event_for_booking(
     damage_types = session.get("damage_types") or []
     photo_links = session.get("photo_links") or []
 
-    description_lines = [
-        f"Customer: {customer_name}",
-        f"Phone: {customer_phone}",
-        f"Email: {customer_email}",
-        "",
-    ]
+    desc = []
+    desc.append(f"Customer: {customer_name}")
+    desc.append(f"Phone: {customer_phone}")
+    desc.append(f"Email: {customer_email}")
+    desc.append("")
 
     if photo_links:
-        description_lines.append("Photo links (Twilio):")
+        desc.append("Photo links:")
         for url in photo_links:
-            description_lines.append(url)
-        description_lines.append("")
+            desc.append(url)
+        desc.append("")
 
     if vin_info.get("vin"):
-        description_lines.append(
+        desc.append(
             f"Vehicle VIN: {vin_info.get('vin')} "
-            f"({vin_info.get('year', 'unknown')} {vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')})"
+            f"({vin_info.get('year')} {vin_info.get('make')} {vin_info.get('model')})"
         )
-        description_lines.append("")
+        desc.append("")
+
     if areas:
-        description_lines.append("Damaged areas:")
+        desc.append("Damaged areas:")
         for a in areas:
-            description_lines.append(f"- {a}")
+            desc.append(f"- {a}")
+
     if damage_types:
-        description_lines.append("")
-        description_lines.append("Damage types:")
-        description_lines.append(", ".join(damage_types))
+        desc.append("")
+        desc.append("Damage types:")
+        desc.append(", ".join(damage_types))
+
     if estimate:
-        description_lines.append("")
-        description_lines.append(
-            f"AI Estimated Severity: {estimate.get('severity', 'unknown')} "
-            f"Cost: ${estimate.get('min_cost', 0)}–${estimate.get('max_cost', 0)}"
+        desc.append("")
+        desc.append(
+            f"AI Estimate: {estimate.get('severity')} "
+            f"${estimate.get('min_cost')}–${estimate.get('max_cost')}"
         )
 
     event = {
         "summary": f"Repair booking - {customer_name}",
-        "description": "\n".join(description_lines),
+        "description": "\n".join(desc),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Toronto"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "America/Toronto"},
         "attendees": [{"email": customer_email}],
@@ -1296,92 +1060,155 @@ def create_calendar_event_for_booking(
 
     try:
         created = service.events().insert(calendarId=calendar_id, body=event).execute()
-        event_id = created.get("id")
-        return True, "Booking added to calendar.", event_id
+        return True, "Booking added to calendar.", created.get("id")
     except Exception as e:
-        return False, f"Failed to create calendar event: {e}", None
+        return False, f"Calendar error: {e}", None
+
 
 # ============================================================
-# Booking helpers: hours + availability + suggestions
+# MAIN BOOKING HANDLER
 # ============================================================
 
-APPOINTMENT_DURATION_HOURS = 1
-MIN_LEAD_MINUTES = 60  # at least 1 hour in advance
+def handle_booking_request(
+    shop: Shop,
+    body: str,
+    lower_body: str,
+    from_number: str,
+    session: Dict[str, Any],
+) -> Optional[str]:
+    """Full booking flow. Returns SMS response or None."""
+    
+    # Detect email anywhere
+    email = extract_email(body)
 
+    # Detect datetime anywhere
+    appt_dt = parse_appointment_datetime(body)
 
-def parse_appointment_datetime(text: str) -> datetime:
-    """
-    Parse natural language date/time like 'Nov 28 9am', '2025-11-28 09:00',
-    'tomorrow at 3pm', etc. Returns naive datetime (local).
-    """
-    dt = date_parser.parse(text, fuzzy=True)
-    # Treat as local naive (America/Toronto) without tzinfo
-    if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
-    return dt
-
-
-def get_shop_hours_for_day(shop: Shop, dt: datetime) -> Optional[Tuple[time, time]]:
-    day_keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    key = day_keys[dt.weekday()]
-    hours_cfg = (shop.hours or DEFAULT_HOURS).get(key) or []
-    if len(hours_cfg) != 2:
-        return None
-    start_str, end_str = hours_cfg
-    try:
-        start_h = datetime.strptime(start_str, "%H:%M").time()
-        end_h = datetime.strptime(end_str, "%H:%M").time()
-        return start_h, end_h
-    except Exception:
-        return None
-
-
-def is_within_shop_hours(shop: Shop, dt: datetime) -> bool:
-    h = get_shop_hours_for_day(shop, dt)
-    if not h:
-        return False
-    start_h, end_h = h
-    t = dt.time()
-    return start_h <= t < end_h
-
-
-def is_slot_available(db, shop: Shop, dt: datetime) -> bool:
-    start = dt
-    end = dt + timedelta(hours=APPOINTMENT_DURATION_HOURS)
-    existing = (
-        db.query(Booking)
-        .filter(
-            Booking.shop_id == shop.id,
-            Booking.appointment_time >= start,
-            Booking.appointment_time < end,
+    # Detect “only time” → ask for date
+    only_time = re.fullmatch(r"\s*\d{1,2}\s*(am|pm)\s*", lower_body)
+    if only_time:
+        return (
+            "Please include a DATE along with the time.\n"
+            "Example: John Doe, email@example.com, Nov 29 3pm"
         )
-        .all()
-    )
-    return len(existing) == 0
 
+    # Not a booking-like message
+    if not booking_like_message(body, lower_body, email, appt_dt):
+        return None
 
-def format_slot(dt: datetime) -> str:
-    return dt.strftime("%a %b %d %I:%M%p").replace("AM", "am").replace("PM", "pm")
+    # Missing datetime
+    if appt_dt is None:
+        return (
+            "I need both DATE and TIME to book an appointment.\n"
+            "Example: John Doe, email@example.com, Nov 29 3pm"
+        )
 
+    # Missing email (required)
+    if not email:
+        return (
+            "I can reserve that time, but I need your EMAIL to complete booking.\n"
+            "Please send name, email, and date/time together.\n"
+            "Example: John Doe, email@example.com, Nov 29 3pm"
+        )
 
-def find_next_available_slots(
-    db, shop: Shop, start_from: datetime, count: int = 3
-) -> List[datetime]:
-    slots: List[datetime] = []
-    cur = start_from
-    end_limit = start_from + timedelta(days=14)
+    # Extract name (everything before email)
+    full_name = extract_name_part(body, email)
+    if not full_name:
+        full_name = "Customer"
 
-    while cur < end_limit and len(slots) < count:
-        if is_within_shop_hours(shop, cur):
-            if cur > datetime.utcnow() + timedelta(minutes=MIN_LEAD_MINUTES):
-                if is_slot_available(db, shop, cur):
-                    slots.append(cur)
-        cur += timedelta(minutes=30)  # scan every 30 minutes
+    # Must be in the future
+    now = datetime.utcnow()
+    if appt_dt <= now + timedelta(minutes=MIN_LEAD_MINUTES):
+        with db_session() as db:
+            suggestions = find_next_available_slots(
+                db, shop, now + timedelta(minutes=MIN_LEAD_MINUTES)
+            )
+        if suggestions:
+            msg = ["That time is too soon.", ""]
+            msg.append("Next available times:")
+            for s in suggestions:
+                msg.append(f"- {format_slot(s)}")
+            msg.append("")
+            msg.append("Reply with your name, email, and chosen time.")
+            return "\n".join(msg)
+        else:
+            return "That time is too soon. Please pick another future time."
 
-    return slots
+    # Hours + availability validation
+    with db_session() as db:
 
-# ============================================================
-# Twilio webhook (MMS + VIN + estimate + booking + DB)
+        # Closed that day
+        hours = get_shop_hours_for_day(shop, appt_dt)
+        if not hours:
+            suggestions = find_next_available_slots(db, shop, appt_dt)
+            msg = ["The shop is CLOSED at that time."]
+            if suggestions:
+                msg.append("")
+                msg.append("Next available times:")
+                for s in suggestions:
+                    msg.append(f"- {format_slot(s)}")
+                msg.append("")
+                msg.append("Reply with your name, email, and chosen time.")
+            return "\n".join(msg)
+
+        # Outside hours
+        if not is_within_shop_hours(shop, appt_dt):
+            suggestions = find_next_available_slots(db, shop, appt_dt)
+            msg = ["That time is OUTSIDE shop hours."]
+            if suggestions:
+                msg.append("")
+                msg.append("Open times:")
+                for s in suggestions:
+                    msg.append(f"- {format_slot(s)}")
+                msg.append("")
+                msg.append("Reply with your name, email, and chosen time.")
+            return "\n".join(msg)
+
+        # Double-booking
+        if not is_slot_available(db, shop, appt_dt):
+            suggestions = find_next_available_slots(db, shop, appt_dt)
+            msg = ["That time is already BOOKED."]
+            if suggestions:
+                msg.append("")
+                msg.append("Other times available:")
+                for s in suggestions:
+                    msg.append(f"- {format_slot(s)}")
+                msg.append("")
+                msg.append("Reply with your name, email, and chosen time.")
+            return "\n".join(msg)
+
+        # Slot is valid — save in DB + Calendar
+        customer = get_or_create_customer(
+            db, phone=from_number, full_name=full_name, email=email
+        )
+
+        success, calendar_msg, event_id = create_calendar_event_for_booking(
+            shop,
+            customer_name=full_name,
+            customer_email=email,
+            customer_phone=from_number,
+            appt_start=appt_dt,
+            session=session,
+        )
+
+        save_booking_record(
+            db,
+            customer=customer,
+            shop_id=shop.id,
+            appointment_time=appt_dt,
+            calendar_event_id=event_id,
+        )
+
+    # Final confirmation message
+    if success:
+        return f"Your appointment is booked!\nTime: {format_slot(appt_dt)}\n{calendar_msg}"
+    else:
+        return (
+            f"Your booking was saved but calendar failed:\n{calendar_msg}\n"
+            f"Requested time: {format_slot(appt_dt)}"
+        )
+        # ============================================================
+# TWILIO WEBHOOK: PHOTOS → PRE-SCAN → ESTIMATE → BOOKING
 # ============================================================
 
 @app.post("/sms-webhook")
@@ -1393,13 +1220,15 @@ async def sms_webhook(request: Request):
 
     if not shop:
         reply.message(
-            "This number is not configured correctly. Please contact the body shop directly."
+            "This number is not configured for a shop. "
+            "Please contact the collision centre directly."
         )
         return Response(content=str(reply), media_type="application/xml")
 
     try:
         form = await request.form()
         body = (form.get("Body") or "").strip()
+        lower_body = body.lower()
         from_number = form.get("From", "")
         num_media_str = form.get("NumMedia", "0") or "0"
 
@@ -1408,69 +1237,67 @@ async def sms_webhook(request: Request):
         except ValueError:
             num_media = 0
 
+        # Load / init session
         cleanup_sessions()
         key = session_key(shop, from_number)
         session = SESSIONS.get(key) or {}
-        lower_body = body.lower()
 
-        # A) Incoming MMS -> PRE-SCAN
+        # ----------------------------------------------------
+        # A) MMS photos → AI PRE-SCAN
+        # ----------------------------------------------------
         if num_media > 0:
             image_data_urls: List[str] = []
-            media_links: List[str] = []  # store original Twilio media URLs
+            media_links: List[str] = []
 
             for i in range(num_media):
                 media_url = form.get(f"MediaUrl{i}")
-                content_type = form.get(f"MediaContentType{i}") or "image/jpeg"
+                ctype = form.get(f"MediaContentType{i}") or "image/jpeg"
                 if not media_url:
                     continue
 
-                media_links.append(media_url)  # keep link for calendar
+                media_links.append(media_url)
 
                 try:
                     raw = download_twilio_media(media_url)
                 except Exception:
                     reply.message(
-                        "Sorry — I couldn't download the photos from your carrier. "
+                        "Sorry — I couldn't download the photos. "
                         "Please resend 1–3 clear photos of the damaged area."
                     )
                     return Response(content=str(reply), media_type="application/xml")
 
-                data_url = bytes_to_data_url(raw, content_type)
+                data_url = bytes_to_data_url(raw, ctype)
                 image_data_urls.append(data_url)
 
             if not image_data_urls:
                 reply.message(
-                    "Sorry — I had trouble reading the photos. "
+                    "Sorry — I couldn't process the photos. "
                     "Please resend 1–3 clear photos of the damaged area."
                 )
-            else:
-                try:
-                    pre_scan = run_pre_scan(image_data_urls, shop)
-                except Exception:
-                    reply.message(
-                        "Sorry — I couldn't process the photos. "
-                        "Please try sending them again."
-                    )
-                    return Response(content=str(reply), media_type="application/xml")
+                return Response(content=str(reply), media_type="application/xml")
 
-                session.update(
-                    {
-                        "areas": pre_scan.get("areas", []),
-                        "damage_types": pre_scan.get("damage_types", []),
-                        "notes": pre_scan.get("notes", ""),
-                        "raw_pre_scan": pre_scan.get("raw", ""),
-                        "photo_links": media_links,  # for calendar
-                        "created_at": datetime.utcnow(),
-                    }
-                )
-                SESSIONS[key] = session
+            pre_scan = run_pre_scan(image_data_urls, shop)
 
-                vin_info = session.get("vin_info")
-                reply.message(build_pre_scan_sms(shop, pre_scan, vin_info))
+            session.update(
+                {
+                    "areas": pre_scan.get("areas", []),
+                    "damage_types": pre_scan.get("damage_types", []),
+                    "notes": pre_scan.get("notes", ""),
+                    "raw_pre_scan": pre_scan.get("raw", ""),
+                    "photo_links": media_links,
+                    "created_at": datetime.utcnow(),
+                }
+            )
+            SESSIONS[key] = session
 
+            vin_info = session.get("vin_info")
+            text = build_pre_scan_sms(shop, pre_scan, vin_info)
+            reply.message(text)
             return Response(content=str(reply), media_type="application/xml")
 
-        # B) Reply 1 -> confirm pre-scan, send estimate (DB failures logged but don't break SMS)
+        # ----------------------------------------------------
+        # B) Reply 1 → confirm pre-scan → run ESTIMATE
+        # ----------------------------------------------------
         if lower_body in {"1", "yes", "y"}:
             if not session.get("areas") and not session.get("damage_types"):
                 reply.message(
@@ -1482,7 +1309,6 @@ async def sms_webhook(request: Request):
             vin_info = session.get("vin_info")
 
             try:
-                # 1) Generate estimate first (no DB yet)
                 estimate = run_estimate(
                     shop,
                     session.get("areas", []),
@@ -1492,14 +1318,12 @@ async def sms_webhook(request: Request):
                 session["last_estimate"] = estimate
                 SESSIONS[key] = session
 
-                # 2) Try to save to DB, but don't break SMS if DB fails
+                # Save estimate + vehicle info in DB
                 try:
                     with db_session() as db:
                         customer = get_or_create_customer(db, phone=from_number)
-
                         if vin_info:
                             upsert_vehicle_from_vin(db, customer, vin_info)
-
                         save_estimate_record(
                             db,
                             customer=customer,
@@ -1513,7 +1337,6 @@ async def sms_webhook(request: Request):
                     print("DB error while saving estimate:", repr(db_err))
                     traceback.print_exc()
 
-                # 3) Build the SMS to send to the customer
                 text = build_estimate_sms(
                     shop,
                     session.get("areas", []),
@@ -1521,28 +1344,32 @@ async def sms_webhook(request: Request):
                     estimate,
                     vin_info=vin_info,
                 )
+                reply.message(text)
+                return Response(content=str(reply), media_type="application/xml")
 
             except Exception as e:
                 print("ERROR in estimate generation:", repr(e))
                 traceback.print_exc()
-                text = (
-                    "Sorry — I couldn’t generate the estimate just now. "
+                reply.message(
+                    "Sorry — I couldn't generate your estimate just now. "
                     "Please resend the photos to start again."
                 )
+                return Response(content=str(reply), media_type="application/xml")
 
-            reply.message(text)
-            return Response(content=str(reply), media_type="application/xml")
-
-        # C) Reply 2 -> pre-scan wrong
+        # ----------------------------------------------------
+        # C) Reply 2 → pre-scan incorrect → reset session
+        # ----------------------------------------------------
         if lower_body in {"2", "no", "n"}:
             SESSIONS.pop(key, None)
             reply.message(
                 "No problem. Please send 1–3 clearer photos of the damaged area "
-                "(include a wide shot plus a couple close-ups) and I'll rescan it."
+                "(a wide shot plus a couple close-ups) and I’ll rescan it."
             )
             return Response(content=str(reply), media_type="application/xml")
 
-        # D) VIN message
+        # ----------------------------------------------------
+        # D) VIN handling — 17-character VIN text
+        # ----------------------------------------------------
         stripped = body.replace(" ", "").upper()
         if len(stripped) == 17 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", stripped):
             vin_info = decode_vin_with_ai(stripped)
@@ -1551,194 +1378,51 @@ async def sms_webhook(request: Request):
                 session["created_at"] = datetime.utcnow()
             SESSIONS[key] = session
 
+            # Save/update vehicle in DB
             with db_session() as db:
                 customer = get_or_create_customer(db, phone=from_number)
                 upsert_vehicle_from_vin(db, customer, vin_info)
 
-            msg = [
+            msg_lines = [
                 "VIN decoded:",
                 f"VIN: {vin_info.get('vin')}",
                 f"Year: {vin_info.get('year')}",
                 f"Make: {vin_info.get('make')}",
                 f"Model: {vin_info.get('model')}",
+                f"Body style: {vin_info.get('body_style')}",
             ]
-            reply.message("\n".join(msg))
+            reply.message("\n".join(msg_lines))
             return Response(content=str(reply), media_type="application/xml")
 
-        # E) Booking request (simplified format):
-        # "Book Full Name, email@example.com, Nov 28 9am"
-        if lower_body.startswith("book"):
-            # Remove the word "book" and split the rest by comma
-            remainder = body[4:].strip()
-            parts = [p.strip() for p in remainder.split(",") if p.strip()]
-            if len(parts) < 3:
-                reply.message(
-                    "To book, please reply like this:\n"
-                    "Book Full Name, email@example.com, Nov 28 9am"
-                )
-                return Response(content=str(reply), media_type="application/xml")
-
-            full_name = parts[0]
-            email = parts[1]
-            dt_str = ",".join(parts[2:])  # in case date contains comma
-
-            try:
-                appt_dt = parse_appointment_datetime(dt_str)
-            except Exception:
-                reply.message(
-                    "I couldn't read that date/time. Please try something like:\n"
-                    "Book John Smith, john@email.com, Nov 28 9am"
-                )
-                return Response(content=str(reply), media_type="application/xml")
-
-            now_utc = datetime.utcnow()
-            if appt_dt <= now_utc + timedelta(minutes=MIN_LEAD_MINUTES):
-                with db_session() as db:
-                    suggestions = find_next_available_slots(
-                        db, shop, now_utc + timedelta(minutes=MIN_LEAD_MINUTES)
-                    )
-                if suggestions:
-                    lines = [
-                        "That time is too soon or already past.",
-                        "",
-                        "Here are some next available times:",
-                    ]
-                    for s in suggestions:
-                        lines.append(f"- {format_slot(s)}")
-                    lines.append("")
-                    lines.append(
-                        "To book one of these, reply like:\n"
-                        "Book Full Name, email@example.com, Wed Nov 27 3pm"
-                    )
-                    reply.message("\n".join(lines))
-                else:
-                    reply.message(
-                        "That time is too soon or in the past. Please pick a future time during open hours."
-                    )
-                return Response(content=str(reply), media_type="application/xml")
-
-            # Check business hours and availability
-            with db_session() as db:
-                hours = get_shop_hours_for_day(shop, appt_dt)
-                if not hours:
-                    # Closed that day
-                    suggestions = find_next_available_slots(db, shop, appt_dt)
-                    lines = [
-                        "The shop is closed at that date/time.",
-                    ]
-                    if suggestions:
-                        lines.append("")
-                        lines.append("Here are some next available times:")
-                        for s in suggestions:
-                            lines.append(f"- {format_slot(s)}")
-                        lines.append("")
-                        lines.append(
-                            "To book one of these, reply like:\n"
-                            "Book Full Name, email@example.com, Thu Nov 28 9am"
-                        )
-                    else:
-                        lines.append(
-                            "Please choose another day during our open hours (Mon–Sat)."
-                        )
-                    reply.message("\n".join(lines))
-                    return Response(content=str(reply), media_type="application/xml")
-
-                if not is_within_shop_hours(shop, appt_dt):
-                    suggestions = find_next_available_slots(db, shop, appt_dt)
-                    lines = [
-                        "That time is outside shop hours.",
-                    ]
-                    if suggestions:
-                        lines.append("")
-                        lines.append("Here are some times within open hours:")
-                        for s in suggestions:
-                            lines.append(f"- {format_slot(s)}")
-                        lines.append("")
-                        lines.append(
-                            "To book one of these, reply like:\n"
-                            "Book Full Name, email@example.com, Fri Nov 29 10am"
-                        )
-                    else:
-                        lines.append(
-                            "Please select a time within our open hours (Mon–Sat)."
-                        )
-                    reply.message("\n".join(lines))
-                    return Response(content=str(reply), media_type="application/xml")
-
-                if not is_slot_available(db, shop, appt_dt):
-                    suggestions = find_next_available_slots(
-                        db, shop, appt_dt + timedelta(minutes=1)
-                    )
-                    lines = [
-                        "That time is already booked.",
-                    ]
-                    if suggestions:
-                        lines.append("")
-                        lines.append("Here are some other available times:")
-                        for s in suggestions:
-                            lines.append(f"- {format_slot(s)}")
-                        lines.append("")
-                        lines.append(
-                            "To book one of these, reply like:\n"
-                            "Book Full Name, email@example.com, Sat Nov 30 11am"
-                        )
-                    else:
-                        lines.append(
-                            "Please choose another time during our open hours (Mon–Sat)."
-                        )
-                    reply.message("\n".join(lines))
-                    return Response(content=str(reply), media_type="application/xml")
-
-                # Slot is valid and free -> save + calendar
-                customer = get_or_create_customer(
-                    db, phone=from_number, full_name=full_name, email=email
-                )
-
-                success, msg, event_id = create_calendar_event_for_booking(
-                    shop,
-                    customer_name=full_name,
-                    customer_email=email,
-                    customer_phone=from_number,
-                    appt_start=appt_dt,
-                    session=session,
-                )
-
-                save_booking_record(
-                    db,
-                    customer=customer,
-                    shop_id=shop.id,
-                    appointment_time=appt_dt,
-                    calendar_event_id=event_id,
-                )
-
-            if success:
-                reply.message(
-                    "Your repair appointment has been booked.\n\n"
-                    f"{msg}\n\n"
-                    f"Time: {format_slot(appt_dt)}"
-                )
-            else:
-                reply.message(
-                    "I saved your booking details, but couldn't add it to the calendar automatically:\n"
-                    f"{msg}\n\nThe shop will follow up to confirm your time.\n\n"
-                    f"Requested time: {format_slot(appt_dt)}"
-                )
-
+        # ----------------------------------------------------
+        # E) Booking — flexible ANY-ORDER booking handler
+        # ----------------------------------------------------
+        booking_response = handle_booking_request(
+            shop=shop,
+            body=body,
+            lower_body=lower_body,
+            from_number=from_number,
+            session=session,
+        )
+        if booking_response is not None:
+            reply.message(booking_response)
             SESSIONS[key] = session
             return Response(content=str(reply), media_type="application/xml")
 
+        # ----------------------------------------------------
         # F) Default instructions
+        # ----------------------------------------------------
         instructions = (
             f"Hi from {shop.name}!\n\n"
             "To get an AI-powered damage estimate:\n"
             "1) Send 1–3 clear photos of the damaged area.\n"
-            "2) I’ll send a quick AI Pre-Scan.\n"
+            "2) I’ll analyze them and send an AI Pre-Scan.\n"
             "3) Reply 1 if it looks right, or 2 if it’s off.\n"
             "4) Then I'll send your full Ontario 2025 cost estimate.\n\n"
             "Optional:\n"
             "- Text your 17-character VIN to decode your vehicle details.\n"
-            "- After your estimate, book a repair by replying:\n"
-            "  Book Full Name, email@example.com, Nov 28 9am"
+            "- After your estimate, book a repair by replying with your name, email, and date/time (any order), for example:\n"
+            "  John Doe, email@example.com, Nov 29 3pm"
         )
         reply.message(instructions)
         return Response(content=str(reply), media_type="application/xml")
@@ -1751,8 +1435,9 @@ async def sms_webhook(request: Request):
         )
         return Response(content=str(reply), media_type="application/xml")
 
+
 # ============================================================
-# Admin: list shops + example webhook URLs
+# ADMIN + HEALTHCHECK
 # ============================================================
 
 @app.get("/admin/shops")
@@ -1778,13 +1463,10 @@ async def list_shops():
         )
     return result
 
-# ============================================================
-# Health check
-# ============================================================
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "message": "AI damage estimator with Level-C pricing, DB, fusion, VIN & booking is running",
-    }
+        "message": "AI damage estimator with VIN, fusion pre-scan, Level-C pricing, booking, and calendar integration is running.",
+        }
