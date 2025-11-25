@@ -9,12 +9,29 @@ from typing import Dict, Any, List, Optional
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+
+# OpenAI
 from openai import OpenAI
-from twilio.twiml.messaging_response import MessagingResponse
+
+# Twilio (with safe fallback stub so local import never crashes)
+try:
+    from twilio.twiml.messaging_response import MessagingResponse
+except ImportError:  # simple stub so syntax & local runs still work
+    class MessagingResponse:
+        def __init__(self):
+            self.messages = []
+
+        def message(self, text):
+            self.messages.append(text)
+
+        def __str__(self):
+            # naive XML-ish for local testing
+            body = "".join(f"<Message>{m}</Message>" for m in self.messages)
+            return f"<Response>{body}</Response>"
+
 
 # ============================================================
-# Environment and FastAPI setup
+# Environment + FastAPI
 # ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -28,13 +45,15 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 
 app = FastAPI()
 
+
 # ============================================================
-# Data models
+# Pydantic models for shops (Option B architecture)
 # ============================================================
 
 class LaborRates(BaseModel):
     body: float
     paint: float
+
 
 class BaseFloor(BaseModel):
     minor_min: int
@@ -44,10 +63,12 @@ class BaseFloor(BaseModel):
     severe_min: int
     severe_max: int
 
+
 class ShopPricing(BaseModel):
     labor_rates: LaborRates
     materials_rate: float
     base_floor: BaseFloor
+
 
 class ShopHours(BaseModel):
     monday: List[str]
@@ -58,6 +79,7 @@ class ShopHours(BaseModel):
     saturday: List[str]
     sunday: List[str]
 
+
 class Shop(BaseModel):
     id: str
     name: str
@@ -66,8 +88,9 @@ class Shop(BaseModel):
     pricing: ShopPricing
     hours: ShopHours
 
+
 # ============================================================
-# Shop config loader (Option B architecture)
+# Load SHOPS_JSON from env
 # ============================================================
 
 def load_shops() -> Dict[str, Shop]:
@@ -78,6 +101,11 @@ def load_shops() -> Dict[str, Shop]:
     data = json.loads(raw)
     by_token: Dict[str, Shop] = {}
     for item in data:
+        # Basic validation: make sure required keys exist
+        for key in ["id", "name", "webhook_token", "calendar_id", "pricing", "hours"]:
+            if key not in item:
+                raise RuntimeError(f"SHOPS_JSON missing '{key}' for one of the shops")
+
         shop = Shop(
             id=item["id"],
             name=item["name"],
@@ -89,38 +117,43 @@ def load_shops() -> Dict[str, Shop]:
         by_token[shop.webhook_token] = shop
     return by_token
 
-SHOPS_BY_TOKEN = load_shops()
+
+SHOPS_BY_TOKEN: Dict[str, Shop] = load_shops()
+
 
 # ============================================================
-# In-memory session store (per shop + phone)
+# In-memory sessions (per shop + phone)
 # ============================================================
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_TTL_MINUTES = 120
 
+
 def session_key(shop: Shop, phone: str) -> str:
     return f"{shop.id}:{phone}"
+
 
 def get_session(shop: Shop, phone: str) -> Dict[str, Any]:
     key = session_key(shop, phone)
     now = datetime.utcnow()
     session = SESSIONS.get(key)
     if session:
-        created = session.get("_created_at", now)
-        if isinstance(created, str):
+        created_raw = session.get("_created_at")
+        if created_raw:
             try:
-                created = datetime.fromisoformat(created)
+                created = datetime.fromisoformat(created_raw)
             except Exception:
                 created = now
-        if now - created > timedelta(minutes=SESSION_TTL_MINUTES):
-            session = None
+            if now - created > timedelta(minutes=SESSION_TTL_MINUTES):
+                session = None
     if not session:
-        session = {"_created_at": datetime.utcnow().isoformat()}
+        session = {"_created_at": now.isoformat()}
         SESSIONS[key] = session
     return session
 
+
 # ============================================================
-# Utility helpers
+# Helpers
 # ============================================================
 
 def safe_json_loads(raw: str) -> Dict[str, Any]:
@@ -129,9 +162,6 @@ def safe_json_loads(raw: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-def bytes_to_data_url(data: bytes, content_type: str = "image/jpeg") -> str:
-    b64 = base64.b64encode(data).decode("utf-8")
-    return f"data:{content_type};base64,{b64}"
 
 def download_media(url: str) -> bytes:
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
@@ -141,54 +171,159 @@ def download_media(url: str) -> bytes:
     resp.raise_for_status()
     return resp.content
 
+
+def bytes_to_data_url(data: bytes, content_type: str = "image/jpeg") -> str:
+    b64 = base64.b64encode(data).decode("utf-8")
+    return f"data:{content_type};base64,{b64}"
+
+
 # ============================================================
-# Time parsing and shop hours
+# Flexible date/time parsing (Option 1)
 # ============================================================
 
-def parse_datetime_flexible(text: str) -> Optional[datetime]:
-    """
-    Accepts formats like:
-      2025-11-28 3pm
-      2025-11-28 15:30
-      2025-11-28 3:30 pm
-    Returns a timezone-naive datetime (assumed local).
-    """
-    text = text.strip()
-    text = text.replace(",", " ")
-    text = re.sub(r"\s+", " ", text)
+MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
-    # YYYY-MM-DD HH:MM am/pm
-    m = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text, re.IGNORECASE)
+
+def parse_flexible_time(text: str) -> Optional[tuple]:
+    """
+    Returns (hour, minute) or None.
+    Supports: 2pm, 2 pm, 2:30pm, 14:00, etc.
+    """
+    t = text.lower()
+
+    # e.g. "2:30pm", "2:30 pm"
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t)
     if m:
-        date_str = m.group(1)
-        hour = int(m.group(2))
-        minute = int(m.group(3) or "0")
-        ap = m.group(4).lower()
+        hour = int(m.group(1))
+        minute = int(m.group(2) or "0")
+        ap = m.group(3)
         if ap == "pm" and hour != 12:
             hour += 12
         if ap == "am" and hour == 12:
             hour = 0
-        try:
-            return datetime.strptime(f"{date_str} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
-        except Exception:
-            return None
+        return hour, minute
 
-    # YYYY-MM-DD HH:MM (24h)
-    m = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})", text)
+    # 24h format "14:30"
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
     if m:
-        date_str = m.group(1)
-        hour = int(m.group(2))
-        minute = int(m.group(3))
-        try:
-            return datetime.strptime(f"{date_str} {hour:02d}:{minute:02d}", "%Y-%m-%d %H:%M")
-        except Exception:
-            return None
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+
+    # simple "2pm"
+    m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+    if m:
+        hour = int(m.group(1))
+        minute = 0
+        ap = m.group(2)
+        if ap == "pm" and hour != 12:
+            hour += 12
+        if ap == "am" and hour == 12:
+            hour = 0
+        return hour, minute
 
     return None
 
+
+def parse_flexible_date(text: str) -> Optional[tuple]:
+    """
+    Returns (year, month, day) or None.
+    Handles:
+    - Nov 29
+    - November 29
+    - 29 Nov
+    - 29 November
+    - 2025-11-29
+    - 11/29/2025 or 11/29 (current year)
+    """
+    t = text.lower().replace(",", " ")
+    t = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", t)  # remove 'th', 'st', etc.
+
+    # ISO: 2025-11-29
+    m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t)
+    if m:
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        return year, month, day
+
+    # Numeric: 11/29/2025 or 11/29
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else datetime.utcnow().year
+        if year < 100:
+            year += 2000
+        return year, month, day
+
+    # Month name first: "nov 29", "november 29"
+    m = re.search(r"\b([a-z]{3,9})\s+(\d{1,2})\b", t)
+    if m:
+        month_word = m.group(1)
+        day = int(m.group(2))
+        month = MONTHS.get(month_word[:3], MONTHS.get(month_word, None))
+        if month:
+            year = datetime.utcnow().year
+            return year, month, day
+
+    # Day then month word: "29 nov", "29 november"
+    m = re.search(r"\b(\d{1,2})\s+([a-z]{3,9})\b", t)
+    if m:
+        day = int(m.group(1))
+        month_word = m.group(2)
+        month = MONTHS.get(month_word[:3], MONTHS.get(month_word, None))
+        if month:
+            year = datetime.utcnow().year
+            return year, month, day
+
+    return None
+
+
+def parse_datetime_flexible(text: str) -> (Optional[datetime], List[str]):
+    """
+    Returns (datetime or None, list_of_missing_fields).
+    missing_fields can contain "date" or "time".
+    """
+    missing = []
+
+    date_info = parse_flexible_date(text)
+    time_info = parse_flexible_time(text)
+
+    if not date_info:
+        missing.append("date")
+    if not time_info:
+        missing.append("time")
+
+    if date_info and time_info:
+        year, month, day = date_info
+        hour, minute = time_info
+        try:
+            dt = datetime(year, month, day, hour, minute)
+            return dt, []
+        except ValueError:
+            return None, ["date"]
+
+    return None, missing
+
+
 def shop_is_open(shop: Shop, dt: datetime) -> bool:
-    weekday = dt.strftime("%A").lower()
-    day_hours: List[str] = getattr(shop.hours, weekday)
+    day_name = dt.strftime("%A").lower()
+    day_hours: List[str] = getattr(shop.hours, day_name)
     if not day_hours or day_hours == ["closed"]:
         return False
 
@@ -198,29 +333,24 @@ def shop_is_open(shop: Shop, dt: datetime) -> bool:
             start_str = start_str.strip().lower()
             end_str = end_str.strip().lower()
 
-            def parse_time(t: str):
-                m = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t)
+            def parse_block_time(s: str) -> Optional[datetime]:
+                m = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", s)
                 if not m:
                     return None
                 hour = int(m.group(1))
                 minute = int(m.group(2) or "0")
-                ap = m.group(3).lower()
+                ap = m.group(3)
                 if ap == "pm" and hour != 12:
                     hour += 12
                 if ap == "am" and hour == 12:
                     hour = 0
-                return hour, minute
+                return dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-            parsed_start = parse_time(start_str)
-            parsed_end = parse_time(end_str)
-            if not parsed_start or not parsed_end:
+            start_dt = parse_block_time(start_str)
+            end_dt = parse_block_time(end_str)
+            if not start_dt or not end_dt:
                 continue
 
-            sh, sm = parsed_start
-            eh, em = parsed_end
-
-            start_dt = dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
-            end_dt = dt.replace(hour=eh, minute=em, second=0, microsecond=0)
             if start_dt <= dt <= end_dt:
                 return True
         except Exception:
@@ -228,8 +358,9 @@ def shop_is_open(shop: Shop, dt: datetime) -> bool:
 
     return False
 
+
 # ============================================================
-# VIN decoding (simple heuristic via OpenAI)
+# VIN decoder (AI)
 # ============================================================
 
 VIN_SYSTEM_PROMPT = """
@@ -252,6 +383,7 @@ Respond in strict JSON:
 }
 """.strip()
 
+
 def decode_vin_with_ai(vin: str) -> Dict[str, str]:
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -267,8 +399,9 @@ def decode_vin_with_ai(vin: str) -> Dict[str, str]:
     data["vin"] = vin
     return data
 
+
 # ============================================================
-# Pre-scan multi-image fusion (vision)
+# Pre-scan (multi-image fusion)
 # ============================================================
 
 PRE_SCAN_SYSTEM_PROMPT = """
@@ -283,7 +416,7 @@ Your job:
 4) Write 2–4 bullet-point NOTES describing what you see in plain language.
 5) DO NOT mention cost, prices, or repair methods.
 
-Respond in this JSON schema only:
+Respond in strict JSON:
 
 {
   "areas": ["front bumper", "hood"],
@@ -294,6 +427,7 @@ Respond in this JSON schema only:
   ]
 }
 """.strip()
+
 
 def run_pre_scan(image_data_urls: List[str]) -> Dict[str, Any]:
     content: List[Dict[str, Any]] = [
@@ -332,8 +466,9 @@ def run_pre_scan(image_data_urls: List[str]) -> Dict[str, Any]:
         "notes": notes.strip(),
     }
 
+
 # ============================================================
-# Level-C estimator (AI severity + line items; pricing by shop)
+# Estimator + Level-C pricing
 # ============================================================
 
 ESTIMATE_SYSTEM_PROMPT = """
@@ -352,7 +487,7 @@ Rules:
    - produce a short summary
    - produce a list of line_items with panel, operation, hours_body, hours_paint, and part_cost (part_cost may be 0 if unknown).
 
-Use this JSON schema only:
+Respond in strict JSON:
 
 {
   "severity": "minor | moderate | severe | unknown",
@@ -368,6 +503,7 @@ Use this JSON schema only:
   ]
 }
 """.strip()
+
 
 def run_ai_estimator(areas: List[str], damage_types: List[str], notes: str) -> Dict[str, Any]:
     payload = {
@@ -389,15 +525,16 @@ def run_ai_estimator(areas: List[str], damage_types: List[str], notes: str) -> D
     severity = (data.get("severity") or "unknown").lower()
     if severity not in {"minor", "moderate", "severe"}:
         severity = "unknown"
+    summary = data.get("summary") or ""
     line_items = data.get("line_items") or []
     if not isinstance(line_items, list):
         line_items = []
-    summary = data.get("summary") or ""
     return {
         "severity": severity,
-        "line_items": line_items,
         "summary": summary,
+        "line_items": line_items,
     }
+
 
 def calculate_costs_with_shop_pricing(shop: Shop, ai_result: Dict[str, Any]) -> Dict[str, Any]:
     severity = ai_result["severity"]
@@ -412,7 +549,7 @@ def calculate_costs_with_shop_pricing(shop: Shop, ai_result: Dict[str, Any]) -> 
     elif severity == "severe":
         floor_min, floor_max = base.severe_min, base.severe_max
     else:
-        floor_min, floor_max = 400, 900
+        floor_min, floor_max = 400, 900  # fallback
 
     total_min = 0.0
     total_max = 0.0
@@ -443,14 +580,12 @@ def calculate_costs_with_shop_pricing(shop: Shop, ai_result: Dict[str, Any]) -> 
         "line_items": ai_result["line_items"],
     }
 
+
 def run_estimate(shop: Shop, areas: List[str], damage_types: List[str], notes: str) -> Dict[str, Any]:
     ai_result = run_ai_estimator(areas, damage_types, notes)
     priced = calculate_costs_with_shop_pricing(shop, ai_result)
     return priced
 
-# ============================================================
-# Estimate SMS builder (with booking instructions)
-# ============================================================
 
 def build_estimate_sms(
     shop: Shop,
@@ -494,65 +629,69 @@ def build_estimate_sms(
     lines.append("This is a visual pre-estimate only. Final pricing may change after in-person inspection.")
     lines.append("")
 
-    lines.append("After your estimate, you can book a repair by replying:")
-    lines.append("Book Full Name, email@example.com, 2025-12-01 10:30am")
+    # Booking instructions – shown ONLY after pre-scan is confirmed (we call this after reply "1")
+    lines.append("To book a repair now, reply with:")
+    lines.append("Book Full Name, email@example.com, Nov 29 2pm")
+    lines.append("You can also use formats like 'November 29 2pm' or '2025-11-29 14:00'.")
     lines.append("")
 
     return "\n".join(lines)
 
+
 # ============================================================
-# Booking parsing (any order: name, email, datetime)
+# Booking parser (any order)
 # ============================================================
 
 def extract_email(text: str) -> Optional[str]:
     m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
     return m.group(0) if m else None
 
-def extract_datetime_anywhere(text: str) -> Optional[datetime]:
-    return parse_datetime_flexible(text)
 
 def extract_name_guess(text: str, email: Optional[str]) -> Optional[str]:
-    # remove email and date from text
+    t = text
     if email:
-        text = text.replace(email, " ")
-    # remove obvious date-like fragments (rough)
-    text = re.sub(r"\d{4}-\d{2}-\d{2}", " ", text)
-    text = re.sub(r"\d{1,2}:\d{2}", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip(" ,;")
-    if not text:
+        t = t.replace(email, " ")
+    # strip word "book"
+    t = re.sub(r"\bbook\b", " ", t, flags=re.IGNORECASE)
+    # remove dates/times roughly
+    t = re.sub(r"\d{4}-\d{2}-\d{2}", " ", t)
+    t = re.sub(r"\d{1,2}/\d{1,2}(/\d{2,4})?", " ", t)
+    t = re.sub(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\d{1,2}(:\d{2})?\s*(am|pm)", " ", t, flags=re.IGNORECASE)
+
+    t = re.sub(r"\s+", " ", t).strip(" ,;")
+    if not t:
         return None
-    # keep first 3 words as name
-    parts = text.split()
+    parts = t.split()
     return " ".join(parts[:3])
+
 
 def parse_booking_any_order(raw: str):
     text = raw.strip()
-    if text.lower().startswith("book"):
-        text = text[4:].strip(" ,;")
-
     email = extract_email(text)
-    when = extract_datetime_anywhere(text)
+    dt, missing_dt = parse_datetime_flexible(text)
     name = extract_name_guess(text, email)
 
-    missing = []
+    missing: List[str] = []
     if not name:
         missing.append("name")
-    if not when:
-        missing.append("date/time (YYYY-MM-DD 3pm)")
     if not email:
         missing.append("email")
+    if dt is None:
+        missing.extend(missing_dt)
 
-    return name, email, when, missing
+    # Clean duplicates
+    missing = list(dict.fromkeys(missing))
+    return name, email, dt, missing
 
-# ============================================================
-# Google Calendar stub (you can replace with real API later)
-# ============================================================
 
 def create_calendar_event_stub(shop: Shop, name: str, email: str, phone: str, dt: datetime, notes: str) -> Dict[str, Any]:
-    # This is a stub; replace with google-api-python-client integration if desired.
-    event_id = str(uuid.uuid4())
-    return {"ok": True, "event_id": event_id}
+    # Stub for now – just pretend event is created
+    return {
+        "ok": True,
+        "event_id": str(uuid.uuid4()),
+    }
+
 
 def build_booking_confirmation(name: str, dt: datetime) -> str:
     return (
@@ -563,8 +702,9 @@ def build_booking_confirmation(name: str, dt: datetime) -> str:
         f"Thank you – we look forward to helping you."
     )
 
+
 # ============================================================
-# Main SMS webhook
+# MAIN TWILIO WEBHOOK
 # ============================================================
 
 @app.post("/sms-webhook")
@@ -581,28 +721,29 @@ async def sms_webhook(request: Request):
     session = get_session(shop, from_number)
     reply = MessagingResponse()
 
-    # 1) VIN decoding
+    # 1) VIN handling (17-character string)
     vin_candidate = body.replace(" ", "").upper()
     if len(vin_candidate) == 17 and vin_candidate.isalnum():
         vin_info = decode_vin_with_ai(vin_candidate)
         session["vin_info"] = vin_info
         reply.message(
-            f"VIN decoded: {vin_info.get('year', 'unknown')} {vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')}."
-            "\n\nSend 1–3 clear photos of the damage to continue your AI estimate."
+            f"VIN decoded: {vin_info.get('year', 'unknown')} {vin_info.get('make', 'unknown')} {vin_info.get('model', 'unknown')}.\n\n"
+            "Now send 1–3 clear photos of the damage to start your AI estimate."
         )
         return PlainTextResponse(str(reply), media_type="application/xml")
 
-    # 2) Photos => Pre-scan
+    # 2) Photos → pre-scan
     num_media = int(form.get("NumMedia") or "0")
     if num_media > 0:
         image_data_urls: List[str] = []
         for idx in range(num_media):
             url = form.get(f"MediaUrl{idx}")
+            ctype = form.get(f"MediaContentType{idx}") or "image/jpeg"
             if not url:
                 continue
             try:
                 data = download_media(url)
-                data_url = bytes_to_data_url(data)
+                data_url = bytes_to_data_url(data, ctype)
                 image_data_urls.append(data_url)
             except Exception:
                 continue
@@ -631,17 +772,18 @@ async def sms_webhook(request: Request):
         lines.append(f"AI Pre-Scan for {shop.name}")
         lines.append("")
         if areas:
-            lines.append("Here's what I can clearly see from your photo(s):")
+            lines.append("From your photo(s), I can clearly see damage on:")
             lines.append("- " + ", ".join(areas))
             lines.append("")
         if damage_types:
-            lines.append("Damage types I can see:")
+            lines.append("Damage types I see:")
             lines.append("- " + ", ".join(damage_types))
             lines.append("")
         if notes:
             lines.append("Notes:")
             lines.append(notes)
             lines.append("")
+
         lines.append("If this looks roughly correct, reply 1 and I'll send a full estimate with cost.")
         lines.append("If it's off, reply 2 and you can send clearer / wider photos.")
         lines.append("")
@@ -650,7 +792,7 @@ async def sms_webhook(request: Request):
         reply.message("\n".join(lines))
         return PlainTextResponse(str(reply), media_type="application/xml")
 
-    # 3) User confirms or rejects pre-scan
+    # 3) Confirm / reject pre-scan
     if body.strip() == "1" and "pre_scan" in session:
         pre = session["pre_scan"]
         areas = pre.get("areas", [])
@@ -658,7 +800,7 @@ async def sms_webhook(request: Request):
         notes = pre.get("notes", "")
 
         estimate = run_estimate(shop, areas, damage_types, notes)
-        session["last_estimate"] = estimate
+        session["estimate"] = estimate  # mark that estimate is done
 
         vin_info = session.get("vin_info")
         sms_text = build_estimate_sms(shop, areas, damage_types, estimate, vin_info=vin_info)
@@ -670,20 +812,46 @@ async def sms_webhook(request: Request):
         reply.message("No problem — please send clearer / wider photos of the damage.")
         return PlainTextResponse(str(reply), media_type="application/xml")
 
-    # 4) Booking flow
-    if body.lower().startswith("book"):
+    # 4) Booking – ONLY after estimate is done
+    # Detect booking if:
+    # - user message starts with "book" OR
+    # - message contains an email AND something date-like (flexible)
+    lower_body = body.lower()
+    looks_like_booking = False
+    if lower_body.startswith("book"):
+        looks_like_booking = True
+    elif extract_email(body):
+        # If it has email + at least one month word or YYYY-MM-DD or dd/mm
+        if re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b", lower_body) or \
+           re.search(r"\d{4}-\d{2}-\d{2}", lower_body) or \
+           re.search(r"\d{1,2}/\d{1,2}", lower_body):
+            looks_like_booking = True
+
+    if looks_like_booking:
+        if "estimate" not in session:
+            reply.message(
+                "Before booking, please send photos so I can generate your AI estimate. "
+                "Then you can book a repair with your name, email, and date/time."
+            )
+            return PlainTextResponse(str(reply), media_type="application/xml")
+
         name, email, when, missing = parse_booking_any_order(body)
         if missing:
             reply.message(
-                "I couldn't read that fully. Please include: name, email, and date/time in this format:"
-                "\nBook Full Name, email@example.com, 2025-12-01 10:30am"
+                "I couldn't read all the booking details.\n\n"
+                "Please include:\n"
+                "- Your full name\n"
+                "- Your email\n"
+                "- Date & time (e.g. Nov 29 2pm or 2025-11-29 14:00)\n\n"
+                "Example:\n"
+                "Book John Doe, john@example.com, Nov 29 2pm"
             )
             return PlainTextResponse(str(reply), media_type="application/xml")
 
         if not shop_is_open(shop, when):
             reply.message(
-                "That time appears to be outside shop hours or unavailable. "
-                "Please choose another date/time within business hours."
+                "That time appears to be outside the shop's hours or unavailable.\n"
+                "Please choose another date/time during business hours."
             )
             return PlainTextResponse(str(reply), media_type="application/xml")
 
@@ -708,14 +876,23 @@ async def sms_webhook(request: Request):
     intro_lines.append("")
     intro_lines.append("To get an AI-powered damage estimate:")
     intro_lines.append("1) Send 1–3 clear photos of the damaged area.")
-    intro_lines.append("2) I'll send a quick AI Pre-Scan.")
+    intro_lines.append("2) I'll send an AI Pre-Scan.")
     intro_lines.append("3) Reply 1 if it looks right, or 2 if it's off.")
     intro_lines.append("4) Then I'll send your full Ontario 2025 cost estimate.")
     intro_lines.append("")
     intro_lines.append("Optional:")
     intro_lines.append("- Text your 17-character VIN to decode your vehicle details.")
     intro_lines.append("- After your estimate, book a repair by replying:")
-    intro_lines.append("  Book Full Name, email@example.com, 2025-12-01 10:30am")
+    intro_lines.append("  Book Full Name, email@example.com, Nov 29 2pm")
 
     reply.message("\n".join(intro_lines))
     return PlainTextResponse(str(reply), media_type="application/xml")
+
+
+# ============================================================
+# Simple healthcheck
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "AI estimator + booking service running"}
