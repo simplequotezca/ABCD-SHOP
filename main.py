@@ -1,4 +1,7 @@
-# deploy reset
+# ============================================================
+# AI Estimator – Production-Stable Version (Part 1/3)
+# ============================================================
+
 import os
 import re
 import json
@@ -10,23 +13,38 @@ from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-
 from pydantic import BaseModel
-from openai import OpenAI
 
+# OpenAI 1.3.9 (stable + compatible with Railway)
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Twilio (stable)
 try:
     from twilio.twiml.messaging_response import MessagingResponse
 except ImportError:
+    # Safe fallback for local testing
     class MessagingResponse:
         def __init__(self): self.msg=[]
-        def message(self,t): self.msg.append(t)
-        def __str__(self): return "<Response>" + "".join(f"<Message>{m}</Message>" for m in self.msg) + "</Response>"
+        def message(self, t): self.msg.append(t)
+        def __str__(self): 
+            return "<Response>" + "".join(f"<Message>{m}</Message>" for m in self.msg) + "</Response>"
+
 
 app = FastAPI()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# ============================================================
+# ENVIRONMENT VARIABLES (Twilio + Shops)
+# ============================================================
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+
+
+# ============================================================
+# SHOP MODELS (Pricing, Hours, Shop Structure)
+# ============================================================
 
 class LaborRates(BaseModel):
     body: float
@@ -57,16 +75,24 @@ class ShopHours(BaseModel):
 class Shop(BaseModel):
     id: str
     name: str
-    webhook_token: str
-    calendar_id: str
+    webhook_token: str     # token in Twilio webhook URL
+    calendar_id: str       # Google Calendar ID
     pricing: ShopPricing
     hours: ShopHours
 
+
+# ============================================================
+# LOAD SHOPS_JSON FROM ENV
+# ============================================================
+
 def load_shops() -> Dict[str, Shop]:
     raw = os.getenv("SHOPS_JSON")
-    if not raw: raise RuntimeError("SHOPS_JSON missing")
+    if not raw:
+        raise RuntimeError("ERROR: SHOPS_JSON environment variable missing!")
+
     data = json.loads(raw)
-    out={}
+    out = {}
+
     for s in data:
         shop = Shop(
             id=s["id"],
@@ -76,33 +102,63 @@ def load_shops() -> Dict[str, Shop]:
             pricing=ShopPricing(**s["pricing"]),
             hours=ShopHours(**s["hours"])
         )
+        # Mapping: token → shop object
         out[shop.webhook_token] = shop
+
     return out
+
 
 SHOPS_BY_TOKEN = load_shops()
 
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL = 120
 
-def sess_key(shop: Shop, phone: str): return f"{shop.id}:{phone}"
+# ============================================================
+# SESSION HANDLING (per shop + phone number)
+# ============================================================
+
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_TTL_MINUTES = 120  # 2 hours per user
+
+
+def sess_key(shop: Shop, phone: str):
+    return f"{shop.id}:{phone}"
+
 
 def get_session(shop: Shop, phone: str):
     key = sess_key(shop, phone)
     now = datetime.utcnow()
+
     s = SESSIONS.get(key)
     if s:
-        try: created = datetime.fromisoformat(s["_created"])
-        except: created = now
-        if now - created > timedelta(minutes=SESSION_TTL):
-            s=None
+        # Check if session expired
+        try:
+            created = datetime.fromisoformat(s["_created"])
+        except:
+            created = now
+
+        if now - created > timedelta(minutes=SESSION_TTL_MINUTES):
+            s = None  # expired
+
     if not s:
-        s={"_created": now.isoformat()}
-        SESSIONS[key]=s
+        s = {"_created": now.isoformat()}
+        SESSIONS[key] = s
+
     return s
 
+
+# ============================================================
+# SAFE JSON PARSER
+# ============================================================
+
 def safe_json(raw):
-    try: return json.loads(raw)
-    except: return {}
+    try:
+        return json.loads(raw)
+    except:
+        return {}
+
+
+# ============================================================
+# MEDIA DOWNLOAD FROM TWILIO (WITH AUTH)
+# ============================================================
 
 def download_media(url: str) -> bytes:
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
@@ -112,115 +168,174 @@ def download_media(url: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+
 def to_data_url(data: bytes, ctype="image/jpeg"):
-    return "data:%s;base64,%s" % (ctype, base64.b64encode(data).decode())
+    return "data:%s;base64,%s" % (
+        ctype,
+        base64.b64encode(data).decode()
+    )
     # ============================================================
-# Flexible date + time parsing (Option 1 — Full Natural Language)
+# FLEXIBLE DATE + TIME PARSING (NATURAL LANGUAGE)
 # ============================================================
 
 MONTHS = {
-    "jan":1,"january":1, "feb":2,"february":2, "mar":3,"march":3,
-    "apr":4,"april":4, "may":5,
-    "jun":6,"june":6, "jul":7,"july":7,
-    "aug":8,"august":8,
-    "sep":9,"sept":9,"september":9,
-    "oct":10,"october":10,
-    "nov":11,"november":11,
-    "dec":12,"december":12
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
 }
 
+
 def parse_time_any(text: str) -> Optional[tuple]:
+    """Parse times like '2pm', '2:30pm', '14:30'."""
     t = text.lower()
 
+    # 1) 2:30pm / 02:30 pm
     m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t)
     if m:
-        hour=int(m.group(1))
-        minute=int(m.group(2) or "0")
-        ap=m.group(3)
-        if ap=="pm" and hour!=12: hour+=12
-        if ap=="am" and hour==12: hour=0
-        return hour,minute
+        hour = int(m.group(1))
+        minute = int(m.group(2) or "0")
+        ap = m.group(3)
+        if ap == "pm" and hour != 12:
+            hour += 12
+        if ap == "am" and hour == 12:
+            hour = 0
+        return hour, minute
 
+    # 2) 14:30 (24h)
     m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
     if m:
-        h=int(m.group(1)); m2=int(m.group(2))
-        if 0<=h<=23 and 0<=m2<=59:
-            return h,m2
+        h = int(m.group(1))
+        m2 = int(m.group(2))
+        if 0 <= h <= 23 and 0 <= m2 <= 59:
+            return h, m2
 
+    # 3) 2pm / 11am
     m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
     if m:
-        hour=int(m.group(1)); minute=0
-        ap=m.group(2)
-        if ap=="pm" and hour!=12: hour+=12
-        if ap=="am" and hour==12: hour=0
-        return hour,minute
+        hour = int(m.group(1))
+        minute = 0
+        ap = m.group(2)
+        if ap == "pm" and hour != 12:
+            hour += 12
+        if ap == "am" and hour == 12:
+            hour = 0
+        return hour, minute
 
     return None
 
-def parse_date_any(text: str) -> Optional[tuple]:
-    t=text.lower().replace(","," ")
-    t=re.sub(r"(\d+)(st|nd|rd|th)", r"\1", t)
 
+def parse_date_any(text: str) -> Optional[tuple]:
+    """Parse YYYY-MM-DD, MM/DD(/YY), and 'Nov 29' / '29 Nov'."""
+    t = text.lower().replace(",", " ")
+    t = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", t)
+
+    # 1) 2025-11-29
     m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
+    # 2) 11/29(/25)
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)
     if m:
-        month=int(m.group(1)); day=int(m.group(2))
-        year=int(m.group(3)) if m.group(3) else datetime.utcnow().year
-        if year<100: year+=2000
-        return year,month,day
+        month = int(m.group(1))
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else datetime.utcnow().year
+        if year < 100:
+            year += 2000
+        return year, month, day
 
+    # 3) Nov 29
     m = re.search(r"\b([a-z]{3,9})\s+(\d{1,2})\b", t)
     if m:
-        w=m.group(1); d=int(m.group(2))
-        month=MONTHS.get(w[:3], MONTHS.get(w))
-        if month: return datetime.utcnow().year,month,d
+        w = m.group(1)
+        d = int(m.group(2))
+        month = MONTHS.get(w[:3], MONTHS.get(w))
+        if month:
+            return datetime.utcnow().year, month, d
 
+    # 4) 29 Nov
     m = re.search(r"\b(\d{1,2})\s+([a-z]{3,9})\b", t)
     if m:
-        d=int(m.group(1)); w=m.group(2)
-        month=MONTHS.get(w[:3], MONTHS.get(w))
-        if month: return datetime.utcnow().year,month,d
+        d = int(m.group(1))
+        w = m.group(2)
+        month = MONTHS.get(w[:3], MONTHS.get(w))
+        if month:
+            return datetime.utcnow().year, month, d
 
     return None
 
+
 def parse_datetime_any(text: str):
-    missing=[]
-    date_info=parse_date_any(text)
-    time_info=parse_time_any(text)
-    if not date_info: missing.append("date")
-    if not time_info: missing.append("time")
+    """
+    Returns (datetime_or_None, missing_fields_list)
+    missing_fields_list can contain "date" and/or "time".
+    """
+    missing = []
+    date_info = parse_date_any(text)
+    time_info = parse_time_any(text)
+
+    if not date_info:
+        missing.append("date")
+    if not time_info:
+        missing.append("time")
+
     if date_info and time_info:
-        y,m,d=date_info
-        h,mi=time_info
-        try: return datetime(y,m,d,h,mi), []
-        except: return None, ["date"]
+        y, m, d = date_info
+        h, mi = time_info
+        try:
+            return datetime(y, m, d, h, mi), []
+        except Exception:
+            # bad date like Feb 31
+            return None, ["date"]
+
     return None, missing
 
+
 def shop_open(shop: Shop, dt: datetime) -> bool:
+    """
+    Check if the shop is open at a given datetime
+    based on the configured hours blocks, e.g. ["9am-5pm"].
+    """
     day = dt.strftime("%A").lower()
     hours: List[str] = getattr(shop.hours, day)
-    if not hours or hours == ["closed"]: return False
+    if not hours or hours == ["closed"]:
+        return False
 
     for block in hours:
         try:
-            s,e = block.split("-")
-            s=s.strip().lower(); e=e.strip().lower()
+            s, e = block.split("-")
+            s = s.strip().lower()
+            e = e.strip().lower()
 
-            def parse_block(t):
-                m=re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t)
-                if not m: return None
-                h=int(m.group(1)); mi=int(m.group(2) or "0"); ap=m.group(3)
-                if ap=="pm" and h!=12: h+=12
-                if ap=="am" and h==12: h=0
-                return dt.replace(hour=h,minute=mi,second=0,microsecond=0)
+            def parse_block(t: str):
+                m = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", t)
+                if not m:
+                    return None
+                h = int(m.group(1))
+                mi = int(m.group(2) or "0")
+                ap = m.group(3)
+                if ap == "pm" and h != 12:
+                    h += 12
+                if ap == "am" and h == 12:
+                    h = 0
+                return dt.replace(hour=h, minute=mi, second=0, microsecond=0)
 
-            sd=parse_block(s); ed=parse_block(e)
-            if sd and ed and sd<=dt<=ed: return True
-        except:
+            sd = parse_block(s)
+            ed = parse_block(e)
+            if sd and ed and sd <= dt <= ed:
+                return True
+        except Exception:
             continue
+
     return False
 
 
@@ -229,29 +344,38 @@ def shop_open(shop: Shop, dt: datetime) -> bool:
 # ============================================================
 
 VIN_PROMPT = """
-You decode 17-character VINs.
-Respond ONLY in JSON:
+You decode 17-character VINs for vehicles.
+
+Rules:
+- Respond ONLY in JSON.
+- If unsure about any field, use "unknown".
+
+Example JSON:
 {
-  "year": "...",
-  "make": "...",
-  "model": "...",
-  "body_style": "..."
+  "year": "2020",
+  "make": "Toyota",
+  "model": "Camry",
+  "body_style": "Sedan"
 }
-Use 'unknown' if not sure.
 """.strip()
 
-def decode_vin(vin: str) -> Dict[str,str]:
-    c=client.chat.completions.create(
+
+def decode_vin(vin: str) -> Dict[str, str]:
+    """
+    Use GPT to decode VIN — not official, but good enough
+    for a nicer customer experience.
+    """
+    c = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0,
-        response_format={"type":"json_object"},
+        response_format={"type": "json_object"},
         messages=[
-            {"role":"system","content":VIN_PROMPT},
-            {"role":"user","content":vin}
-        ]
+            {"role": "system", "content": VIN_PROMPT},
+            {"role": "user", "content": vin},
+        ],
     )
-    out=safe_json(c.choices[0].message.content or "{}")
-    out["vin"]=vin
+    out = safe_json(c.choices[0].message.content or "{}")
+    out["vin"] = vin
     return out
 
 
@@ -260,163 +384,280 @@ def decode_vin(vin: str) -> Dict[str,str]:
 # ============================================================
 
 PRESCAN_PROMPT = """
-Fuse ALL photos. Identify damaged areas, damage types, and short notes.
-Respond ONLY:
+You are an auto body pre-scan assistant.
+
+Fuse ALL provided accident photos and respond ONLY in JSON:
+
 {
- "areas":[...],
- "damage_types":[...],
- "notes":[...]
+  "areas": ["rear bumper", "trunk lid", "left tail light"],
+  "damage_types": ["deep dent", "scratch", "crack"],
+  "notes": [
+    "Rear bumper has deep dent and cracking near the corner.",
+    "Trunk lid is misaligned.",
+    "Left tail light lens appears cracked."
+  ]
 }
+
+- 'areas' = list of affected panels/zones (lowercase)
+- 'damage_types' = list of generic damage terms (lowercase)
+- 'notes' = short bullet-style observations (you may join later)
 """.strip()
 
+
 def run_prescan(images: List[str]):
-    content=[{"type":"text","text":"Fuse all photos and respond in JSON only."}]
+    """
+    images: list of image data URLs (base64) or HTTPS URLs.
+    Returns normalized dict: {areas, damage_types, notes_str}.
+    """
+    content = [
+        {"type": "text", "text": "Fuse all photos and respond in JSON only."}
+    ]
     for url in images[:3]:
-        content.append({"type":"image_url","image_url":{"url":url}})
-    c=client.chat.completions.create(
+        content.append({"type": "image_url", "image_url": {"url": url}})
+
+    c = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0,
-        response_format={"type":"json_object"},
+        response_format={"type": "json_object"},
         messages=[
-            {"role":"system","content":PRESCAN_PROMPT},
-            {"role":"user","content":content}
-        ]
+            {"role": "system", "content": PRESCAN_PROMPT},
+            {"role": "user", "content": content},
+        ],
     )
-    data=safe_json(c.choices[0].message.content or "{}")
-    areas=[a.lower() for a in data.get("areas",[])]
-    dmg=[d.lower() for d in data.get("damage_types",[])]
-    notes=data.get("notes",[])
-    if isinstance(notes,list): notes=" ".join(notes)
-    return {"areas":areas,"damage_types":dmg,"notes":notes}
+
+    data = safe_json(c.choices[0].message.content or "{}")
+    areas = [a.lower() for a in data.get("areas", [])]
+    dmg = [d.lower() for d in data.get("damage_types", [])]
+    notes = data.get("notes", [])
+
+    if isinstance(notes, list):
+        notes = " ".join(notes)
+
+    return {"areas": areas, "damage_types": dmg, "notes": notes}
 
 
 # ============================================================
-# ESTIMATOR + LEVEL-C PRICING
+# ESTIMATOR (SEVERITY + LINE ITEMS) – NO DOLLAR AMOUNTS
 # ============================================================
 
 ESTIMATOR_PROMPT = """
-You output severity, summary, and line_items. NO dollar amounts.
-JSON only:
+You are a collision damage estimating assistant.
+
+Input JSON:
 {
- "severity":"minor|moderate|severe|unknown",
- "summary":"...",
- "line_items":[
-   {"panel":"...","operation":"replace|repair","hours_body":1.0,"hours_paint":1.0,"part_cost":0}
- ]
+  "areas": [...],
+  "damage_types": [...],
+  "notes": "..."
 }
+
+Output STRICTLY this JSON (no extra text):
+
+{
+  "severity": "minor|moderate|severe|unknown",
+  "summary": "Short, customer-friendly summary of the visible damage and work involved.",
+  "line_items": [
+    {
+      "panel": "rear bumper cover",
+      "operation": "replace|repair",
+      "hours_body": 1.5,
+      "hours_paint": 2.0,
+      "part_cost": 350
+    }
+  ]
+}
+
+Rules:
+- Do NOT include any currency symbols or totals.
+- hours_body + hours_paint are approximate labor hours.
+- part_cost is approximate parts cost (0 if no obvious part).
+- severity:
+  - minor: mostly cosmetic, low hours/parts
+  - moderate: multiple panels or parts
+  - severe: structural areas, heavy damage, many parts
 """.strip()
 
+
 def run_ai_estimator(areas, dmg, notes):
-    payload={"areas":areas,"damage_types":dmg,"notes":notes}
-    c=client.chat.completions.create(
+    payload = {"areas": areas, "damage_types": dmg, "notes": notes}
+
+    c = client.chat.completions.create(
         model="gpt-4.1-mini",
         temperature=0,
-        response_format={"type":"json_object"},
+        response_format={"type": "json_object"},
         messages=[
-            {"role":"system","content":ESTIMATOR_PROMPT},
-            {"role":"user","content":json.dumps(payload)}
-        ]
+            {"role": "system", "content": ESTIMATOR_PROMPT},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
     )
-    raw=c.choices[0].message.content or "{}"
-    data=safe_json(raw)
-    sev=data.get("severity","unknown").lower()
-    if sev not in {"minor","moderate","severe"}: sev="unknown"
-    summary=data.get("summary","")
-    items=data.get("line_items",[])
-    if not isinstance(items,list): items=[]
-    return {"severity":sev,"summary":summary,"line_items":items}
 
-def price_with_shop(shop: Shop, ai):
-    sev=ai["severity"]
-    base=shop.pricing.base_floor
-    if sev=="minor":
-        floor_min,floor_max=base.minor_min,base.minor_max
-    elif sev=="moderate":
-        floor_min,floor_max=base.moderate_min,base.moderate_max
-    elif sev=="severe":
-        floor_min,floor_max=base.severe_min,base.severe_max
+    raw = c.choices[0].message.content or "{}"
+    data = safe_json(raw)
+
+    sev = (data.get("severity") or "unknown").lower()
+    if sev not in {"minor", "moderate", "severe"}:
+        sev = "unknown"
+
+    summary = data.get("summary", "")
+    items = data.get("line_items", [])
+    if not isinstance(items, list):
+        items = []
+
+    return {"severity": sev, "summary": summary, "line_items": items}
+
+
+# ============================================================
+# PRICING ENGINE (SHOP-SPECIFIC)
+# ============================================================
+
+def price_with_shop(shop: Shop, ai: Dict[str, Any]):
+    """
+    Convert AI line_items + severity into a CAD price range,
+    respecting each shop's labor rates + base floors.
+    """
+    sev = ai["severity"]
+    base = shop.pricing.base_floor
+
+    if sev == "minor":
+        floor_min, floor_max = base.minor_min, base.minor_max
+    elif sev == "moderate":
+        floor_min, floor_max = base.moderate_min, base.moderate_max
+    elif sev == "severe":
+        floor_min, floor_max = base.severe_min, base.severe_max
     else:
-        floor_min,floor_max=400,900
+        floor_min, floor_max = 400, 900  # generic fallback
 
-    lr=shop.pricing.labor_rates
-    mat=shop.pricing.materials_rate
+    lr = shop.pricing.labor_rates
+    mat = shop.pricing.materials_rate
 
-    total_min=0; total_max=0
+    total_min = 0.0
+    total_max = 0.0
+
     for it in ai["line_items"]:
-        hb=float(it.get("hours_body") or 0)
-        hp=float(it.get("hours_paint") or 0)
-        pc=float(it.get("part_cost") or 0)
-        labor=hb*lr.body + hp*lr.paint
-        materials=hp*mat
-        if pc>0:
-            total_min+=labor+materials+pc*0.9
-            total_max+=labor+materials+pc*1.1
-        else:
-            total_min+=labor+materials
-            total_max+=labor+materials
+        hb = float(it.get("hours_body") or 0)
+        hp = float(it.get("hours_paint") or 0)
+        pc = float(it.get("part_cost") or 0)
 
-    total_min=max(total_min, floor_min)
-    total_max=max(total_max, floor_max)
+        labor = hb * lr.body + hp * lr.paint
+        materials = hp * mat
+
+        if pc > 0:
+            total_min += labor + materials + pc * 0.9
+            total_max += labor + materials + pc * 1.1
+        else:
+            total_min += labor + materials
+            total_max += labor + materials
+
+    total_min = max(total_min, floor_min)
+    total_max = max(total_max, floor_max)
 
     return {
-        "severity":sev,
-        "summary":ai["summary"],
-        "min_cost":int(total_min),
-        "max_cost":int(total_max),
-        "line_items":ai["line_items"]
+        "severity": sev,
+        "summary": ai["summary"],
+        "min_cost": int(total_min),
+        "max_cost": int(total_max),
+        "line_items": ai["line_items"],
     }
 
-def run_estimate(shop, areas, dmg, notes):
-    ai=run_ai_estimator(areas, dmg, notes)
+
+def run_estimate(shop: Shop, areas, dmg, notes):
+    ai = run_ai_estimator(areas, dmg, notes)
     return price_with_shop(shop, ai)
 
 
-def build_estimate_sms(shop, areas, dmg, est, vin=None):
-    L=[]
+def build_estimate_sms(shop: Shop, areas, dmg, est, vin=None):
+    """Build the final SMS text sent to the customer after confirmation."""
+    L = []
     L.append(f"AI Damage Estimate for {shop.name}\n")
+
     if vin and vin.get("vin"):
-        L.append(f"Vehicle: {vin.get('year','?')} {vin.get('make','?')} {vin.get('model','?')}\n")
+        L.append(
+            f"Vehicle: {vin.get('year', '?')} "
+            f"{vin.get('make', '?')} "
+            f"{vin.get('model', '?')}\n"
+        )
+
     L.append(f"Severity: {est['severity'].capitalize()}")
-    L.append(f"Estimated Cost (Ontario 2025): ${est['min_cost']} – ${est['max_cost']}\n")
+    L.append(
+        f"Estimated Cost (Ontario 2025): "
+        f"${est['min_cost']} – ${est['max_cost']}\n"
+    )
+
     if areas:
-        L.append("Areas:\n- "+", ".join(areas)+"\n")
+        L.append("Areas:")
+        L.append("- " + ", ".join(areas) + "\n")
+
     if dmg:
-        L.append("Damage Types:\n- "+", ".join(dmg)+"\n")
+        L.append("Damage Types:")
+        L.append("- " + ", ".join(dmg) + "\n")
+
     if est["summary"]:
-        L.append(est["summary"]+"\n")
+        L.append(est["summary"] + "\n")
+
     L.append("To book a repair, reply with:")
     L.append("Book Full Name, email@example.com, Nov 29 2pm\n")
+
     return "\n".join(L)
     # ============================================================
-# BOOKING PARSER (ANY ORDER)
+# BOOKING PARSER (ANY ORDER: NAME, EMAIL, DATE, TIME)
 # ============================================================
 
 def extract_email(text: str) -> Optional[str]:
     m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
     return m.group(0) if m else None
 
+
 def extract_name(text: str, email: Optional[str]) -> Optional[str]:
     t = text
-    if email: t = t.replace(email, " ")
+    if email:
+        t = t.replace(email, " ")
+
+    # Remove keyword "book"
     t = re.sub(r"\bbook\b", " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\d{4}-\d{2}-\d{2}", " ", t)
-    t = re.sub(r"\d{1,2}/\d{1,2}(/\d{2,4})?", " ", t)
-    t = re.sub(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", " ", t, flags=re.IGNORECASE)
+
+    # Remove obvious date formats
+    t = re.sub(r"\d{4}-\d{2}-\d{2}", " ", t)  # 2025-11-29
+    t = re.sub(r"\d{1,2}/\d{1,2}(/\d{2,4})?", " ", t)  # 11/29(/25)
+
+    # Remove month words
+    t = re.sub(
+        r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b",
+        " ",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove times like 2pm, 2:30pm
     t = re.sub(r"\d{1,2}(:\d{2})?\s*(am|pm)", " ", t, flags=re.IGNORECASE)
+
+    # Normalize spaces
     t = re.sub(r"\s+", " ", t).strip(" ,;")
     if not t:
         return None
+
+    # Take up to first 3 tokens as name
     return " ".join(t.split()[:3])
 
+
 def parse_booking_any_order(raw: str):
+    """
+    Accepts messy booking text like:
+    'Book John Doe, john@example.com, Nov 29 at 2pm'
+    Returns: (name, email, datetime_or_None, missing_fields_list)
+    """
     text = raw.strip()
     email = extract_email(text)
     dt, missing_dt = parse_datetime_any(text)
     name = extract_name(text, email)
-    missing=[]
-    if not name: missing.append("name")
-    if not email: missing.append("email")
-    if dt is None: missing.extend(missing_dt)
+
+    missing = []
+    if not name:
+        missing.append("name")
+    if not email:
+        missing.append("email")
+    if dt is None:
+        missing.extend(missing_dt)
+
+    # Deduplicate missing fields
     missing = list(dict.fromkeys(missing))
     return name, email, dt, missing
 
@@ -425,12 +666,20 @@ def parse_booking_any_order(raw: str):
 # GOOGLE CALENDAR EVENT (SERVICE ACCOUNT STUB)
 # ============================================================
 
-def create_calendar_event(shop: Shop, name: str, email: str, phone: str, dt: datetime, notes: str):
+def create_calendar_event(
+    shop: Shop,
+    name: str,
+    email: str,
+    phone: str,
+    dt: datetime,
+    notes: str,
+):
     """
-    Your Google service account is shared with the calendar,
-    so you CAN plug in actual googleapiclient here later.
+    Stub for Google Calendar.
+    Later you can plug in googleapiclient + service account.
 
-    For now we return a stub event so booking never crashes.
+    Right now it just pretends the event was created successfully
+    so that the booking flow never breaks.
     """
     return {"ok": True, "event_id": str(uuid.uuid4())}
 
@@ -447,7 +696,9 @@ def build_booking_confirmation(name: str, dt: datetime) -> str:
         f"Time: {dt.strftime('%I:%M %p')}\n\n"
         f"Thank you — we look forward to helping you!"
     )
-    # ============================================================
+
+
+# ============================================================
 # MAIN TWILIO WEBHOOK
 # ============================================================
 
@@ -457,6 +708,7 @@ async def sms_webhook(request: Request):
     body = (form.get("Body") or "").strip()
     from_number = form.get("From") or ""
 
+    # Identify shop via ?token= in webhook URL
     token = request.query_params.get("token")
     shop = SHOPS_BY_TOKEN.get(token or "")
     if not shop:
@@ -466,14 +718,16 @@ async def sms_webhook(request: Request):
     reply = MessagingResponse()
 
     # =======================================================
-    # VIN DETECTION
+    # VIN DETECTION (17-CHARACTER, AUTO-TRIMMED)
     # =======================================================
     vin_candidate = body.replace(" ", "").upper()
     if len(vin_candidate) == 17 and vin_candidate.isalnum():
         vin_info = decode_vin(vin_candidate)
         session["vin"] = vin_info
         reply.message(
-            f"VIN decoded: {vin_info.get('year','unknown')} {vin_info.get('make','unknown')} {vin_info.get('model','unknown')}.\n\n"
+            f"VIN decoded: {vin_info.get('year', 'unknown')} "
+            f"{vin_info.get('make', 'unknown')} "
+            f"{vin_info.get('model', 'unknown')}.\n\n"
             "Now send 1–3 clear photos of the damage."
         )
         return PlainTextResponse(str(reply), media_type="application/xml")
@@ -491,7 +745,8 @@ async def sms_webhook(request: Request):
                 try:
                     data = download_media(url)
                     imgs.append(to_data_url(data, ctype))
-                except:
+                except Exception:
+                    # Ignore this image and continue
                     pass
 
         if not imgs:
@@ -501,17 +756,21 @@ async def sms_webhook(request: Request):
         prescan = run_prescan(imgs)
         session["prescan"] = prescan
 
-        L=[]
+        L = []
         L.append(f"AI Pre-Scan for {shop.name}\n")
+
         if prescan["areas"]:
             L.append("Visible damage areas:")
             L.append("- " + ", ".join(prescan["areas"]) + "\n")
+
         if prescan["damage_types"]:
             L.append("Damage types:")
             L.append("- " + ", ".join(prescan["damage_types"]) + "\n")
+
         if prescan["notes"]:
             L.append("Notes:")
             L.append(prescan["notes"] + "\n")
+
         L.append("If this looks correct, reply 1.")
         L.append("If it's off, reply 2 and send clearer photos.")
         L.append("\nOptional: text your 17-character VIN anytime.")
@@ -520,7 +779,7 @@ async def sms_webhook(request: Request):
         return PlainTextResponse(str(reply), media_type="application/xml")
 
     # =======================================================
-    # CONFIRM PRE-SCAN
+    # CONFIRM PRE-SCAN → RUN FULL ESTIMATE
     # =======================================================
     if body == "1" and "prescan" in session:
         ps = session["prescan"]
@@ -535,7 +794,7 @@ async def sms_webhook(request: Request):
         return PlainTextResponse(str(reply), media_type="application/xml")
 
     # =======================================================
-    # REJECT PRE-SCAN
+    # REJECT PRE-SCAN → ASK FOR CLEARER PHOTOS
     # =======================================================
     if body == "2" and "prescan" in session:
         session.pop("prescan", None)
@@ -543,11 +802,12 @@ async def sms_webhook(request: Request):
         return PlainTextResponse(str(reply), media_type="application/xml")
 
     # =======================================================
-    # BOOKING LOGIC — ONLY ALLOWED AFTER ESTIMATE
+    # BOOKING LOGIC — ONLY AFTER AN ESTIMATE EXISTS
     # =======================================================
     lower = body.lower()
     looks_booking = False
 
+    # Heuristic: "book" keyword or email + date/time patterns
     if lower.startswith("book"):
         looks_booking = True
     elif extract_email(body):
@@ -591,25 +851,27 @@ async def sms_webhook(request: Request):
             email=email,
             phone=from_number,
             dt=dt,
-            notes="AI estimate booking"
+            notes="AI estimate booking",
         )
 
         if not event.get("ok"):
-            reply.message("There was a problem creating your booking. Please try again.")
+            reply.message(
+                "There was a problem creating your booking. Please try again."
+            )
             return PlainTextResponse(str(reply), media_type="application/xml")
 
         reply.message(build_booking_confirmation(name, dt))
         return PlainTextResponse(str(reply), media_type="application/xml")
 
     # =======================================================
-    # DEFAULT INTRO MESSAGE
+    # DEFAULT INTRO MESSAGE (FIRST-TIME / RANDOM TEXT)
     # =======================================================
-    intro=[]
+    intro = []
     intro.append(f"Hi from {shop.name}!\n")
     intro.append("To get an AI damage estimate:")
     intro.append("1) Send 1–3 photos of the damage.")
     intro.append("2) I'll analyze them with AI.")
-    intro.append("3) Confirm with 1.")
+    intro.append("3) Confirm the pre-scan by replying 1.")
     intro.append("4) Then I'll send your full estimate.\n")
     intro.append("Optional:")
     intro.append("- Text your 17-character VIN to decode your vehicle.")
