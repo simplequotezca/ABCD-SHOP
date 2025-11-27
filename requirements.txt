@@ -1,9 +1,11 @@
-fastapi==0.110.1
+fastapi==0.111.0
 uvicorn==0.29.0
-python-multipart==0.0.6
+python-multipart==0.0.9
 requests==2.31.0
 twilio==8.10.0
-openai==1.51.0
+
+# 🔥 Correct modern OpenAI SDK (fixes proxies error)
+openai>=1.0.0
 
 pydantic==2.7.0
 pydantic-settings==2.3.2
