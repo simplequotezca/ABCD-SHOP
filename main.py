@@ -53,14 +53,21 @@ Base = declarative_base()
 LOCAL_TZ = ZoneInfo("America/Toronto")
 
 # ============================================================
-# OpenAI Client — v1 Correct Usage
+# OpenAI Client — SAFE INIT (never crashes app)
 # ============================================================
 
+openai_client: Optional[OpenAI]
+
 if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY missing – AI calls will fail")
+    logger.warning("OPENAI_API_KEY is not set – AI features will be disabled")
     openai_client = None
 else:
-    openai_client = OpenAI()   # v1 client reads env automatically
+    try:
+        # Explicit key so the library never has to guess
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize OpenAI client: {e}")
+        openai_client = None
 
 # ============================================================
 # SQLAlchemy Models
@@ -258,7 +265,7 @@ Return ONLY valid JSON:
 
 def run_ai_estimator(image_url: str, shop: Shop, text: str, vin_data: Optional[Dict[str, Any]]):
     if not openai_client:
-        raise RuntimeError("AI unavailable")
+        raise RuntimeError("AI unavailable (OpenAI not configured)")
 
     prompt = build_ai_prompt(shop, text, shop.pricing, vin_data)
 
