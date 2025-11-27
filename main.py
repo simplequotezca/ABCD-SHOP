@@ -56,10 +56,9 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY missing — AI estimator disabled.")
-    openai_client: Optional[OpenAI] = None
+    openai_client = None
 else:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
+    openai_client = OpenAI()   # <-- FIXED. DO NOT PASS api_key
 # ============================================================
 # Database Models
 # ============================================================
