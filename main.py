@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
+
 from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -34,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 SHOPS_JSON = os.getenv("SHOPS_JSON")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -56,9 +56,10 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY missing — AI estimator disabled.")
-    openai_client = None
+    client: Optional[OpenAI] = None
 else:
-    openai_client = OpenAI()   # <-- FIXED. DO NOT PASS api_key
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
 # ============================================================
 # Database Models
 # ============================================================
@@ -181,7 +182,9 @@ def get_calendar_service():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
-    _calendar_service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    _calendar_service = build(
+        "calendar", "v3", credentials=creds, cache_discovery=False
+    )
     return _calendar_service
 
 
@@ -256,13 +259,12 @@ Return ONLY valid JSON:
 
 
 def call_ai_estimator(image_url: str, shop: Shop, text: str, vin_data: dict):
-    if not openai_client:
+    if not client:
         raise RuntimeError("OpenAI not configured")
 
     prompt = build_prompt(shop, text, vin_data)
 
-    # IMPORTANT FIX: use full vision model gpt-4o
-    completion = openai_client.chat.completions.create(
+    completion = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": "Return ONLY JSON."},
@@ -270,12 +272,12 @@ def call_ai_estimator(image_url: str, shop: Shop, text: str, vin_data: dict):
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "input_image", "image_url": image_url},
                 ],
             },
         ],
-        temperature=0.2,
         max_tokens=500,
+        temperature=0.2,
     )
 
     raw = completion.choices[0].message.content
@@ -300,8 +302,9 @@ def sms_estimate(shop: Shop, result: dict, est_id: str):
         f"Estimated Cost: ${result.get('estimated_cost_min'):,.0f} – ${result.get('estimated_cost_max'):,.0f}\n\n"
         f"Areas: {', '.join(result.get('areas') or [])}\n"
         f"Damage: {', '.join(result.get('damage_types') or [])}\n\n"
-        f"Visual estimate only. Reply 1 to book an appointment.\n\n"
-        f"ID: {est_id}"
+        f"This is a visual, preliminary estimate only. Final pricing may vary after an in-person inspection.\n\n"
+        f"Reply 1 to schedule an appointment.\n\n"
+        f"Estimate ID: {est_id}"
     )
 
 
@@ -384,7 +387,7 @@ async def sms_webhook(request: Request):
             return Response(str(tw), media_type="application/xml")
 
         # -------------------------
-        # USER REPLIED "1"
+        # USER REPLY "1" → ask for date/time
         # -------------------------
         if body.lower() in {"1", "book", "one"}:
             br = session.query(BookingRequest).filter(
@@ -400,7 +403,7 @@ async def sms_webhook(request: Request):
             session.commit()
 
             tw.message(
-                "What day/time works best?\n"
+                "Great! What day and time works best for you?\n"
                 "Examples:\n"
                 "- Tomorrow at 3pm\n"
                 "- Friday 10am\n"
@@ -409,7 +412,7 @@ async def sms_webhook(request: Request):
             return Response(str(tw), media_type="application/xml")
 
         # -------------------------
-        # USER PROVIDING DATE/TIME
+        # USER GIVES DATE/TIME
         # -------------------------
         br = session.query(BookingRequest).filter(
             BookingRequest.shop_id == shop.id,
@@ -442,7 +445,7 @@ async def sms_webhook(request: Request):
         # -------------------------
         # DEFAULT
         # -------------------------
-        tw.message("Please send 1–3 clear photos of the damage.")
+        tw.message("To get started, please send 1–3 clear photos of the vehicle damage.")
         return Response(str(tw), media_type="application/xml")
 
     finally:
