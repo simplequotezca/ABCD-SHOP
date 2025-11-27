@@ -45,6 +45,12 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 SHOPS_JSON = os.getenv("SHOPS_JSON")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+if not SHOPS_JSON:
+    raise RuntimeError("SHOPS_JSON is not set")
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -55,7 +61,10 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 # OpenAI — v1 safe init
 # ============================================================
 
-client = OpenAI()
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set – OpenAI calls will fail")
+
+client = OpenAI()  # reads OPENAI_API_KEY from env
 
 # ============================================================
 # SQLAlchemy Models
@@ -64,7 +73,7 @@ client = OpenAI()
 class DamageEstimate(Base):
     __tablename__ = "damage_estimates"
 
-    id = Column(String, primary_primary_key=True, index=True)
+    id = Column(String, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     shop_id = Column(String, index=True)
@@ -93,7 +102,7 @@ class BookingRequest(Base):
     phone_number = Column(String, index=True)
     estimate_id = Column(String, nullable=True)
 
-    step = Column(String, index=True)
+    step = Column(String, index=True)  # "choice", "awaiting_datetime", "completed"
     preferred_text = Column(Text, nullable=True)
     calendar_event_id = Column(String, nullable=True)
 
@@ -115,7 +124,7 @@ class Shop(BaseModel):
 
 def load_shops() -> Dict[str, Shop]:
     raw = json.loads(SHOPS_JSON)
-    shops = {}
+    shops: Dict[str, Shop] = {}
     for item in raw:
         shop = Shop(**item)
         shops[shop.webhook_token] = shop
@@ -128,20 +137,29 @@ SHOPS_BY_TOKEN = load_shops()
 # VIN DECODER
 # ============================================================
 
-VIN_REGEX = r"\b([A-HJ-NPR-Z0-9]{17})\b"   # excludes I, O, Q automatically
+# 17 chars, skipping I/O/Q as per VIN spec
+VIN_REGEX = r"\b([A-HJ-NPR-Z0-9]{17})\b"
 
 
 def extract_vin(text: str) -> Optional[str]:
-    """Find VIN anywhere in user message."""
-    match = re.search(VIN_REGEX, text.replace(" ", "").upper())
+    """
+    Detect VIN anywhere in the message.
+    Customer can just paste the 17-digit VIN – no need for 'VIN:'.
+    """
+    compact = text.replace(" ", "").upper()
+    match = re.search(VIN_REGEX, compact)
     return match.group(1) if match else None
 
 
 def decode_vin(vin: str) -> Dict[str, Any]:
-    """Use NHTSA public API to decode VIN (no key needed)."""
+    """Decode VIN using free NHTSA API."""
     try:
-        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValuesExtended/{vin}?format=json"
+        url = (
+            f"https://vpic.nhtsa.dot.gov/api/vehicles/"
+            f"DecodeVinValuesExtended/{vin}?format=json"
+        )
         res = requests.get(url, timeout=5)
+        res.raise_for_status()
         data = res.json()["Results"][0]
 
         return {
@@ -156,7 +174,8 @@ def decode_vin(vin: str) -> Dict[str, Any]:
             "plant": data.get("PlantCity"),
             "series": data.get("Series"),
         }
-    except Exception:
+    except Exception as e:
+        logger.warning(f"VIN decode failed for {vin}: {e}")
         return {"vin": vin, "error": "VIN decoding failed"}
 
 # ============================================================
@@ -172,14 +191,29 @@ def get_calendar_service():
     if _calendar_service:
         return _calendar_service
 
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    _calendar_service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=SCOPES
+    )
+    _calendar_service = build(
+        "calendar", "v3", credentials=creds, cache_discovery=False
+    )
     return _calendar_service
 
 
-def schedule_calendar_event(shop, phone_number, estimate_id, requested_text):
-    """Parse date/time + book appointment."""
+def schedule_calendar_event(
+    shop: Shop,
+    phone_number: str,
+    estimate_id: Optional[str],
+    requested_text: str,
+):
+    """Parse date/time + book 1-hour appointment if free."""
+    if not shop.calendar_id:
+        raise RuntimeError("Shop does not have a calendar_id configured")
+
     try:
         parsed_dt = date_parser.parse(requested_text, fuzzy=True)
     except Exception:
@@ -192,7 +226,6 @@ def schedule_calendar_event(shop, phone_number, estimate_id, requested_text):
     end_dt = start_dt + timedelta(hours=1)
 
     service = get_calendar_service()
-
     events = (
         service.events()
         .list(
@@ -206,7 +239,7 @@ def schedule_calendar_event(shop, phone_number, estimate_id, requested_text):
     )
 
     if events:
-        raise RuntimeError("Requested time unavailable")
+        raise RuntimeError("Requested time is not available")
 
     event_body = {
         "summary": "Auto Body Estimate Appointment",
@@ -226,15 +259,21 @@ def schedule_calendar_event(shop, phone_number, estimate_id, requested_text):
 # AI DAMAGE ESTIMATOR
 # ============================================================
 
-def build_ai_prompt(shop, user_text, vehicle_hint, pricing_hint, vin_data):
+def build_ai_prompt(
+    shop: Shop,
+    user_text: str,
+    vehicle_hint: str,
+    pricing_hint: Optional[Dict[str, Any]],
+    vin_data: Optional[Dict[str, Any]],
+) -> str:
     pricing_str = json.dumps(pricing_hint, indent=2) if pricing_hint else "null"
     vin_str = json.dumps(vin_data, indent=2) if vin_data else "{}"
 
     return f"""
-You are an expert collision estimator in Ontario (2025).
+You are an expert collision estimator in Ontario, Canada (2025).
 
 CRITICAL LEFT/RIGHT RULE:
-- Always interpret left/right based on DRIVER POV sitting in the driver seat.
+- Always interpret left/right based on DRIVER'S point of view sitting in the driver seat facing forward.
 - Driver side = left.
 - Passenger side = right.
 
@@ -250,14 +289,28 @@ SHOP:
 PRICING:
 {pricing_str}
 
-Return ONLY valid JSON using the provided schema.
+Return ONLY valid JSON using this schema:
+
+{{
+  "severity": "Minor" | "Moderate" | "Severe" | "Total Loss",
+  "estimated_cost_min": number,
+  "estimated_cost_max": number,
+  "areas": [ "... list of areas ..." ],
+  "damage_types": [ "... list of damage types ..." ],
+  "notes": "short explanation",
+  "recommendation": "short next-step advice"
+}}
 """
 
 
-def call_ai_estimator(image_url, shop, user_text, vehicle_hint, vin_data):
-    prompt = build_ai_prompt(
-        shop, user_text, vehicle_hint, shop.pricing, vin_data
-    )
+def call_ai_estimator(
+    image_url: str,
+    shop: Shop,
+    user_text: str,
+    vehicle_hint: str,
+    vin_data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    prompt = build_ai_prompt(shop, user_text, vehicle_hint, shop.pricing, vin_data)
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -278,24 +331,29 @@ def call_ai_estimator(image_url, shop, user_text, vehicle_hint, vin_data):
 
     try:
         return json.loads(content)
-    except:
+    except Exception:
         start = content.find("{")
         end = content.rfind("}")
-        return json.loads(content[start:end + 1])
+        if start == -1 or end == -1 or end <= start:
+            raise RuntimeError("AI did not return JSON")
+        return json.loads(content[start : end + 1])
 
 # ============================================================
-# Formatting Messages
+# Formatting Messages (polished & locked in)
 # ============================================================
 
-def format_estimate_sms(shop, estimate, estimate_id):
-    severity = estimate.get("severity")
+def format_estimate_sms(shop: Shop, estimate: Dict[str, Any], estimate_id: str) -> str:
+    severity = estimate.get("severity") or "Unknown"
     min_cost = estimate.get("estimated_cost_min")
     max_cost = estimate.get("estimated_cost_max")
 
+    try:
+        cost_str = f"${min_cost:,.0f} – ${max_cost:,.0f}"
+    except Exception:
+        cost_str = "N/A"
+
     areas = ", ".join(estimate.get("areas") or [])
     damages = ", ".join(estimate.get("damage_types") or [])
-
-    cost_str = f"${min_cost:,.0f} – ${max_cost:,.0f}"
 
     return (
         f"AI Damage Estimate for {shop.name}\n\n"
@@ -303,36 +361,41 @@ def format_estimate_sms(shop, estimate, estimate_id):
         f"Estimated Cost (Ontario 2025): {cost_str}\n\n"
         f"Areas: {areas}\n"
         f"Damage Types: {damages}\n\n"
-        f"This is a visual, preliminary estimate only. Final pricing may vary after an in-person inspection.\n\n"
-        f"Reply 1 to schedule an appointment.\n\n"
+        "This is a visual, preliminary estimate only. "
+        "Final pricing may vary after an in-person inspection.\n\n"
+        "Reply 1 to schedule an appointment.\n\n"
         f"Estimate ID: {estimate_id}"
     )
 
 
-def format_booking_confirmation(shop, start_dt):
+def format_booking_confirmation(shop: Shop, start_dt: datetime) -> str:
     date = start_dt.strftime("%A, %B %d")
     time = start_dt.strftime("%I:%M %p").lstrip("0")
-
     return (
         f"You're booked at {shop.name} on {date} at {time}.\n\n"
         "If you need to make any changes, please contact the shop directly."
     )
 
 # ============================================================
-# Twilio Webhook
+# FastAPI + Twilio Webhook
 # ============================================================
 
 app = FastAPI()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
     token = request.query_params.get("token")
     if not token:
-        raise HTTPException(400, "Missing token")
+        raise HTTPException(status_code=400, detail="Missing token")
 
     shop = SHOPS_BY_TOKEN.get(token)
     if not shop:
-        raise HTTPException(403, "Invalid token")
+        raise HTTPException(status_code=403, detail="Invalid token")
 
     form = await request.form()
     from_number = form.get("From")
@@ -344,71 +407,102 @@ async def sms_webhook(request: Request):
     twiml = MessagingResponse()
 
     try:
-        # =======================================================
-        # VIN Auto-Detection (in ANY message)
-        # =======================================================
+        # -------------------------------------------------------
+        # VIN auto-detection (works on ANY text)
+        # -------------------------------------------------------
         vin = extract_vin(body)
         vin_data = decode_vin(vin) if vin else None
 
-        # =======================================================
-        # USER SENDS IMAGES → AI ESTIMATE
-        # =======================================================
+        # -------------------------------------------------------
+        # CASE 1: MMS with photos → generate AI estimate
+        # -------------------------------------------------------
         if num_media > 0:
             image_url = form.get("MediaUrl0")
+            if not image_url:
+                twiml.message(
+                    "We couldn't read the photo. Please try sending it again."
+                )
+                return Response(str(twiml), media_type="application/xml")
 
-            estimate_json = call_ai_estimator(
-                image_url, shop, body, body, vin_data
-            )
+            try:
+                estimate_json = call_ai_estimator(
+                    image_url=image_url,
+                    shop=shop,
+                    user_text=raw_body,
+                    vehicle_hint=raw_body,
+                    vin_data=vin_data,
+                )
+            except Exception as e:
+                logger.exception(f"AI estimator failed: {e}")
+                twiml.message(
+                    "We ran into an issue generating the estimate. "
+                    "Please try again in a few minutes or call the shop."
+                )
+                return Response(str(twiml), media_type="application/xml")
 
             estimate_id = str(uuid.uuid4())
 
-            session.add(
-                DamageEstimate(
-                    id=estimate_id,
-                    shop_id=shop.id,
-                    phone_number=from_number,
-                    user_message=raw_body,
-                    vin=vin,
-                    vin_decoded=json.dumps(vin_data),
-                    severity=estimate_json.get("severity"),
-                    estimated_cost_min=estimate_json.get("estimated_cost_min"),
-                    estimated_cost_max=estimate_json.get("estimated_cost_max"),
-                    vehicle_info=raw_body,
-                    ai_raw_json=json.dumps(estimate_json),
+            # Save estimate
+            try:
+                session.add(
+                    DamageEstimate(
+                        id=estimate_id,
+                        shop_id=shop.id,
+                        phone_number=from_number,
+                        user_message=raw_body,
+                        vin=vin,
+                        vin_decoded=json.dumps(vin_data) if vin_data else None,
+                        severity=estimate_json.get("severity"),
+                        estimated_cost_min=estimate_json.get("estimated_cost_min"),
+                        estimated_cost_max=estimate_json.get("estimated_cost_max"),
+                        vehicle_info=raw_body,
+                        ai_raw_json=json.dumps(estimate_json),
+                        ai_summary_text="",
+                    )
                 )
-            )
-            session.commit()
+                session.commit()
+            except Exception as e:
+                logger.exception(f"Failed to save estimate: {e}")
+                session.rollback()
 
-            # Start booking flow
-            session.add(
-                BookingRequest(
-                    id=str(uuid.uuid4()),
-                    shop_id=shop.id,
-                    phone_number=from_number,
-                    estimate_id=estimate_id,
-                    step="choice",
+            # Create booking request in "choice" step
+            try:
+                session.add(
+                    BookingRequest(
+                        id=str(uuid.uuid4()),
+                        shop_id=shop.id,
+                        phone_number=from_number,
+                        estimate_id=estimate_id,
+                        step="choice",
+                    )
                 )
-            )
-            session.commit()
+                session.commit()
+            except Exception as e:
+                logger.exception(f"Failed to create BookingRequest: {e}")
+                session.rollback()
 
             twiml.message(format_estimate_sms(shop, estimate_json, estimate_id))
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(str(twiml), media_type="application/xml")
 
-        # =======================================================
-        # USER REPLIES "1" → ASK FOR DATE/TIME
-        # =======================================================
-        if body in {"1", "one", "book"}:
+        # -------------------------------------------------------
+        # CASE 2: user replies "1" → ask for date/time
+        # -------------------------------------------------------
+        if body.lower() in {"1", "one", "book"}:
             br = (
                 session.query(BookingRequest)
-                .filter(BookingRequest.shop_id == shop.id,
-                        BookingRequest.phone_number == from_number)
+                .filter(
+                    BookingRequest.shop_id == shop.id,
+                    BookingRequest.phone_number == from_number,
+                )
                 .order_by(BookingRequest.created_at.desc())
                 .first()
             )
 
             if not br:
-                twiml.message("Please send photos of the damage to begin.")
-                return Response(content=str(twiml), media_type="application/xml")
+                twiml.message(
+                    "Please send clear photos of the damage first to get an estimate."
+                )
+                return Response(str(twiml), media_type="application/xml")
 
             br.step = "awaiting_datetime"
             session.commit()
@@ -416,15 +510,15 @@ async def sms_webhook(request: Request):
             twiml.message(
                 "Great! What day and time works best for you?\n\n"
                 "Examples:\n"
-                "\"Tuesday at 3pm\"\n"
-                "\"Tomorrow at 10am\"\n"
-                "\"Friday morning\""
+                '"Tuesday at 3pm"\n'
+                '"Tomorrow at 10am"\n'
+                '"Friday morning"'
             )
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(str(twiml), media_type="application/xml")
 
-        # =======================================================
-        # WAITING FOR DATE/TIME → TRY BOOKING
-        # =======================================================
+        # -------------------------------------------------------
+        # CASE 3: waiting for date/time → try to book
+        # -------------------------------------------------------
         br_waiting = (
             session.query(BookingRequest)
             .filter(
@@ -437,36 +531,44 @@ async def sms_webhook(request: Request):
         )
 
         if br_waiting:
-            br_waiting.preferred_text = body
+            br_waiting.preferred_text = raw_body
+            session.commit()
 
             try:
                 start_dt, end_dt, event_id = schedule_calendar_event(
-                    shop, from_number, br_waiting.estimate_id, body
+                    shop=shop,
+                    phone_number=from_number,
+                    estimate_id=br_waiting.estimate_id,
+                    requested_text=raw_body,
                 )
             except ValueError:
                 twiml.message(
-                    "I couldn't understand that date/time. Try again:\n"
-                    "\"Tuesday at 2pm\" or \"Tomorrow at 10am\""
+                    "I couldn't understand that date/time. Try again like:\n"
+                    '"Tuesday at 2pm" or "Tomorrow at 10am".'
                 )
-                return Response(content=str(twiml), media_type="application/xml")
-            except:
+                return Response(str(twiml), media_type="application/xml")
+            except Exception as e:
+                logger.exception(f"Calendar booking failed: {e}")
                 twiml.message(
-                    "That time isn’t available. Please suggest another time."
+                    "That time isn't available or booking isn't configured yet. "
+                    "Please suggest another time or call the shop."
                 )
-                return Response(content=str(twiml), media_type="application/xml")
+                return Response(str(twiml), media_type="application/xml")
 
             br_waiting.step = "completed"
             br_waiting.calendar_event_id = event_id
             session.commit()
 
             twiml.message(format_booking_confirmation(shop, start_dt))
-            return Response(content=str(twiml), media_type="application/xml")
+            return Response(str(twiml), media_type="application/xml")
 
-        # =======================================================
-        # DEFAULT RESPONSE
-        # =======================================================
-        twiml.message("Please send 1–3 clear photos of the damage to begin.")
-        return Response(content=str(twiml), media_type="application/xml")
+        # -------------------------------------------------------
+        # DEFAULT: no media + not in booking flow
+        # -------------------------------------------------------
+        twiml.message(
+            "To get started, please send 1–3 clear photos of the vehicle damage."
+        )
+        return Response(str(twiml), media_type="application/xml")
 
     finally:
         session.close()
