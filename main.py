@@ -63,8 +63,10 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY is not set – OpenAI calls will fail")
-
-client = OpenAI()  # reads OPENAI_API_KEY from env
+    openai_client: Optional[OpenAI] = None
+else:
+    # Explicit api_key, no extra kwargs (so we never hit the 'proxies' error)
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ============================================================
 # SQLAlchemy Models
@@ -155,7 +157,7 @@ def decode_vin(vin: str) -> Dict[str, Any]:
     """Decode VIN using free NHTSA API."""
     try:
         url = (
-            f"https://vpic.nhtsa.dot.gov/api/vehicles/"
+            "https://vpic.nhtsa.dot.gov/api/vehicles/"
             f"DecodeVinValuesExtended/{vin}?format=json"
         )
         res = requests.get(url, timeout=5)
@@ -310,9 +312,12 @@ def call_ai_estimator(
     vehicle_hint: str,
     vin_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    if openai_client is None:
+        raise RuntimeError("OpenAI client is not configured (missing OPENAI_API_KEY)")
+
     prompt = build_ai_prompt(shop, user_text, vehicle_hint, shop.pricing, vin_data)
 
-    completion = client.chat.completions.create(
+    completion = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "Return ONLY JSON."},
@@ -381,6 +386,7 @@ def format_booking_confirmation(shop: Shop, start_dt: datetime) -> str:
 # ============================================================
 
 app = FastAPI()
+
 
 @app.get("/health")
 async def health():
