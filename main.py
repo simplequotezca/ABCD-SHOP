@@ -10,7 +10,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
-import openai  # <= classic client
 
 from sqlalchemy import (
     create_engine,
@@ -25,27 +24,26 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
+# -------------------------------
+# OPENAI (Stable Vision)
+# -------------------------------
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 # ============================================================
-# FASTAPI + OPENAI SETUP
+# FASTAPI SETUP
 # ============================================================
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required")
-
-openai.api_key = OPENAI_API_KEY
-
 # ============================================================
-# DATABASE (POSTGRES / SQLALCHEMY)
+# DATABASE SETUP
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-# Fix old postgres:// format if needed
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
@@ -55,9 +53,6 @@ Base = declarative_base()
 
 
 class EstimateSession(Base):
-    """
-    Stores the latest AI analysis per (shop_token, phone).
-    """
     __tablename__ = "estimate_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -65,17 +60,13 @@ class EstimateSession(Base):
     phone = Column(String(50), index=True)
     analysis_json = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow
-    )
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
 
 # ============================================================
-# MULTI-SHOP CONFIG (FROM SHOPS_JSON ENV)
+# SHOP CONFIG
 # ============================================================
 
 class ShopConfig(BaseModel):
@@ -90,9 +81,9 @@ class ShopConfig(BaseModel):
 def load_shops() -> Dict[str, ShopConfig]:
     raw = os.getenv("SHOPS_JSON")
     if not raw:
-        raise RuntimeError("SHOPS_JSON env variable missing!")
-    data = json.loads(raw)
-    return {shop["webhook_token"]: ShopConfig(**shop) for shop in data}
+        raise RuntimeError("SHOPS_JSON environment variable missing!")
+    arr = json.loads(raw)
+    return {shop["webhook_token"]: ShopConfig(**shop) for shop in arr}
 
 
 shops = load_shops()
@@ -107,13 +98,11 @@ def get_calendar_service():
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
 
     info = json.loads(raw_json)
-
     creds = Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/calendar"]
     )
-    service = build("calendar", "v3", credentials=creds)
-    return service
+    return build("calendar", "v3", credentials=creds)
 
 # ============================================================
 # UTILS
@@ -128,60 +117,43 @@ def fetch_image_as_base64(url: str) -> str:
 def safe_json_parse(raw: str) -> Any:
     text = raw.strip()
     if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 2:
-            text = parts[1]
-        text = text.lstrip("json").strip()
+        text = text.split("```")[1].lstrip("json").strip()
     return json.loads(text)
 
 # ============================================================
-# AI — DAMAGE ANALYSIS (DRIVER POV, ULTRA ACCURATE)
+# AI DAMAGE ANALYSIS — Vision Working Version
 # ============================================================
 
 def analyze_damage(image_base64: str, shop: ShopConfig) -> Dict[str, Any]:
-    pricing = json.dumps(shop.pricing, indent=2)
+    pricing_json = json.dumps(shop.pricing, indent=2)
 
     prompt = f"""
-You are an elite automotive collision damage estimator in Ontario, Canada.
-You MUST analyze damage strictly from the driver's point of view:
-- "driver side" = left side
-- "passenger side" = right side
+You are an elite collision estimator with 20+ years experience.
+Analyze the damage from the DRIVER'S POINT OF VIEW only.
+Use this shop pricing:
+{pricing_json}
 
-Use this pricing context:
-{pricing}
-
-Instructions:
-1. Identify all damaged panels and parts (bumper, fender, hood, trunk, doors, lights, etc.).
-2. Describe severity and type of damage (scratches, scuffs, dents, deep dents, cracks, deformation, structural).
-3. Classify overall severity as one of: "minor", "moderate", "severe".
-4. Estimate realistic labor hours, considering body and paint.
-5. Estimate cost range in CAD using shop pricing and this severity baseline:
-   - minor: 350–650
-   - moderate: 900–1600
-   - severe: 2000–5000+
-6. Be conservative but realistic. This is a visual PRELIMINARY estimate.
-
-Return ONLY valid JSON with:
-- "damage_summary": string
-- "areas": string[]
-- "damage_types": string[]
-- "severity": "minor" | "moderate" | "severe"
-- "recommended_labor_hours": number
-- "estimated_cost_min": number
-- "estimated_cost_max": number
+Return strict JSON:
+- damage_summary (string)
+- areas (string list)
+- damage_types (string list)
+- severity: minor | moderate | severe
+- recommended_labor_hours: number
+- estimated_cost_min: number
+- estimated_cost_max: number
 """
 
-    resp = openai.ChatCompletion.create(
+    resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
-                "content": "You are a professional auto body collision estimator. You output strict JSON, no explanations."
+                "content": "You output only JSON. No extra text."
             },
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    { "type": "text", "text": prompt },
                     {
                         "type": "image_url",
                         "image_url": {
@@ -189,83 +161,68 @@ Return ONLY valid JSON with:
                         }
                     }
                 ]
-            },
+            }
         ],
         temperature=0.1,
     )
 
-    raw = resp["choices"][0]["message"]["content"]
+    raw = resp.choices[0].message.content
     return safe_json_parse(raw)
 
 # ============================================================
-# AI — BOOKING PARSER (FREE TEXT → STRUCTURED INFO)
+# BOOKING PARSER
 # ============================================================
 
-def parse_booking_details(user_text: str, last_analysis: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    analysis_summary = ""
-    if last_analysis:
-        analysis_summary = last_analysis.get("damage_summary", "")
+def parse_booking_info(user_text: str, analysis: Optional[Dict[str, Any]]):
+    summary = analysis.get("damage_summary") if analysis else ""
 
     prompt = f"""
-You are converting a customer's message into structured booking info for an auto body shop.
+Convert the user's message into booking details.
 
-Customer message:
+User message:
 \"\"\"{user_text}\"\"\"
 
+Damage Summary:
+\"\"\"{summary}\"\"\"
 
-Latest damage estimate summary:
-\"\"\"{analysis_summary}\"\"\"
-
-
-Rules:
-- Guess reasonable formatting if needed.
-- The datetime must be in ISO-8601 local time for America/Toronto (e.g. "2025-11-30T14:30:00").
-- If you cannot find a field, put an empty string "" for that field.
-
-Return ONLY valid JSON with keys:
-- name (string)
-- phone (string)
-- email (string)
-- datetime_iso (string, ISO-8601)
-- notes (string)
+Return JSON:
+- name
+- phone
+- email
+- datetime_iso (ISO time, America/Toronto)
+- notes
 """
 
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You output only JSON. No extra text."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-        )
-        raw = resp["choices"][0]["message"]["content"]
-        data = safe_json_parse(raw)
-        if not data.get("datetime_iso"):
-            return None
-        return data
-    except Exception:
-        return None
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Return only JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+    )
+
+    raw = resp.choices[0].message.content
+    return safe_json_parse(raw)
 
 # ============================================================
 # DB HELPERS
 # ============================================================
 
-def save_analysis(shop_token: str, phone: str, analysis: Dict[str, Any]) -> None:
+def save_analysis(shop_token: str, phone: str, analysis: Dict[str, Any]):
     db = SessionLocal()
     try:
-        record = EstimateSession(
+        db.add(EstimateSession(
             shop_token=shop_token,
             phone=phone,
             analysis_json=json.dumps(analysis),
-        )
-        db.add(record)
+        ))
         db.commit()
     finally:
         db.close()
 
 
-def get_latest_analysis(shop_token: str, phone: str) -> Optional[Dict[str, Any]]:
+def load_latest_analysis(shop_token: str, phone: str) -> Optional[Dict[str, Any]]:
     db = SessionLocal()
     try:
         rec = (
@@ -277,139 +234,86 @@ def get_latest_analysis(shop_token: str, phone: str) -> Optional[Dict[str, Any]]
             .order_by(EstimateSession.created_at.desc())
             .first()
         )
-        if not rec:
-            return None
-        return json.loads(rec.analysis_json)
+        return json.loads(rec.analysis_json) if rec else None
     finally:
         db.close()
 
 # ============================================================
-# MESSAGE BUILDERS (TWILIO FLOW)
+# MESSAGE BUILDERS
 # ============================================================
 
-def send_welcome(shop: ShopConfig) -> str:
-    msg = MessagingResponse()
-    msg.message(
-        f"👋 Welcome to *{shop.name}!* \n\n"
-        "To get a fast AI estimate, please send *1–3 clear photos* of the damage "
-        "from a few angles (close and far)."
+def welcome_msg(shop: ShopConfig):
+    r = MessagingResponse()
+    r.message(
+        f"👋 Welcome to *{shop.name}*! \n\n"
+        "Please send 1–3 clear photos of the damage for an instant AI estimate."
     )
-    return str(msg)
+    return str(r)
 
 
-def send_damage_analysis(shop: ShopConfig, analysis: Dict[str, Any]) -> str:
-    msg = MessagingResponse()
-    msg.message(
+def damage_msg(shop: ShopConfig, a: Dict[str, Any]):
+    r = MessagingResponse()
+    r.message(
         f"🔍 *AI Damage Analysis*\n"
-        f"{analysis['damage_summary']}\n\n"
-        f"Areas: {', '.join(analysis.get('areas', []))}\n"
-        f"Damage Types: {', '.join(analysis.get('damage_types', []))}\n"
-        f"Severity: *{analysis.get('severity', '').title()}*\n\n"
-        "If this looks correct, reply *1*.\n"
-        "If you’d like to upload more photos, reply *2*."
+        f"{a['damage_summary']}\n\n"
+        f"Areas: {', '.join(a['areas'])}\n"
+        f"Damage Types: {', '.join(a['damage_types'])}\n"
+        f"Severity: *{a['severity'].title()}*\n\n"
+        "If accurate, reply *1*.\n"
+        "If you'd like to upload more photos, reply *2*."
     )
-    return str(msg)
+    return str(r)
 
 
-def send_full_estimate(shop: ShopConfig, analysis: Dict[str, Any]) -> str:
-    estimate_id = str(uuid.uuid4())
-    cost_min = analysis.get("estimated_cost_min")
-    cost_max = analysis.get("estimated_cost_max")
-    hours = analysis.get("recommended_labor_hours")
-
-    msg = MessagingResponse()
-    msg.message(
-        f"📘 *Full Estimate Breakdown* (ID: {estimate_id})\n\n"
-        f"Estimated Cost Range (visual estimate): "
-        f"${cost_min} – ${cost_max} CAD\n"
-        f"Recommended Labor Hours: ~{hours} hours\n\n"
-        "This is a preliminary AI estimate based on the photos and may be adjusted "
-        "after an in-person inspection.\n\n"
-        "📅 To book an appointment, please reply in ONE message with your:\n"
-        "- Full Name\n"
-        "- Phone Number\n"
+def full_estimate_msg(shop: ShopConfig, a: Dict[str, Any]):
+    r = MessagingResponse()
+    r.message(
+        f"📘 *Full Estimate*\n\n"
+        f"Cost Range: ${a['estimated_cost_min']} – ${a['estimated_cost_max']}\n"
+        f"Labor Hours: {a['recommended_labor_hours']}\n\n"
+        "To book an appointment, reply (all in one message):\n"
+        "- Name\n"
+        "- Phone\n"
         "- Email\n"
-        "- Preferred Date & Time\n\n"
-        "You can send it in any order. We’ll confirm your spot and notify the shop instantly."
+        "- Preferred Date & Time"
     )
-    return str(msg)
+    return str(r)
 
 
-def confirm_booking() -> str:
-    msg = MessagingResponse()
-    msg.message(
-        "✅ Your appointment request has been received and added to our schedule.\n\n"
-        "A team member from the shop will reach out if any adjustments are needed. "
-        "Thank you!"
-    )
-    return str(msg)
-
-
-def ask_for_more_photos() -> str:
-    msg = MessagingResponse()
-    msg.message("No problem at all! 📸\nPlease upload a few more clear photos of the damage.")
-    return str(msg)
-
-
-def generic_confusion() -> str:
-    msg = MessagingResponse()
-    msg.message(
-        "Sorry, I didn’t quite catch that.\n\n"
-        "👉 To continue:\n"
-        "- Send *photos* of the damage for an AI estimate, or\n"
-        "- If you've already received an estimate, reply *1* to see the full breakdown, or\n"
-        "- Reply with your *name, phone, email, and preferred date/time* to book."
-    )
-    return str(msg)
+def booked_msg():
+    r = MessagingResponse()
+    r.message("✅ Your appointment has been booked! The shop will see you soon.")
+    return str(r)
 
 # ============================================================
-# CALENDAR EVENT CREATION
+# GOOGLE CALENDAR BOOKING
 # ============================================================
 
-def create_calendar_event(shop: ShopConfig, booking: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> None:
+def create_calendar_event(shop: ShopConfig, details: Dict[str, Any], analysis: Dict[str, Any]):
     service = get_calendar_service()
 
-    description_lines = [
-        f"Name: {booking.get('name', '')}",
-        f"Phone: {booking.get('phone', '')}",
-        f"Email: {booking.get('email', '')}",
-        "",
-        "Customer Notes:",
-        booking.get("notes", ""),
-        "",
-        "AI Visual Estimate:",
-    ]
+    desc = f"""
+Name: {details['name']}
+Phone: {details['phone']}
+Email: {details['email']}
 
-    if analysis:
-        description_lines.append(analysis.get("damage_summary", ""))
-        description_lines.append("")
-        description_lines.append(f"Areas: {', '.join(analysis.get('areas', []))}")
-        description_lines.append(f"Damage Types: {', '.join(analysis.get('damage_types', []))}")
-        description_lines.append(f"Severity: {analysis.get('severity', '').title()}")
-        description_lines.append(
-            f"Est. Cost: ${analysis.get('estimated_cost_min')} – ${analysis.get('estimated_cost_max')} CAD"
-        )
-        description_lines.append(
-            f"Recommended Labor Hours: {analysis.get('recommended_labor_hours')}"
-        )
+Damage Summary:
+{analysis['damage_summary']}
 
-    description = "\n".join(description_lines)
+Areas: {', '.join(analysis['areas'])}
+Damage Types: {', '.join(analysis['damage_types'])}
+Severity: {analysis['severity']}
+Cost Range: ${analysis['estimated_cost_min']} – ${analysis['estimated_cost_max']}
+"""
 
-    start_dt = booking["datetime_iso"]
-    start = datetime.fromisoformat(start_dt)
+    start = datetime.fromisoformat(details['datetime_iso'])
     end = start + timedelta(hours=1)
 
     event = {
-        "summary": f"AI Estimate Booking — {booking.get('name', 'Customer')}",
-        "description": description,
-        "start": {
-            "dateTime": start.isoformat(),
-            "timeZone": "America/Toronto",
-        },
-        "end": {
-            "dateTime": end.isoformat(),
-            "timeZone": "America/Toronto",
-        },
+        "summary": f"AI Estimate — {details['name']}",
+        "description": desc,
+        "start": {"dateTime": start.isoformat(), "timeZone": "America/Toronto"},
+        "end": {"dateTime": end.isoformat(), "timeZone": "America/Toronto"},
     }
 
     service.events().insert(
@@ -418,15 +322,11 @@ def create_calendar_event(shop: ShopConfig, booking: Dict[str, Any], analysis: O
     ).execute()
 
 # ============================================================
-# MAIN TWILIO WEBHOOK
+# MAIN TWILIO ENDPOINT
 # ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
-    """
-    Twilio webhook URL pattern:
-    https://your-app-url/sms-webhook?token=shop_miss_123
-    """
     form = await request.form()
 
     token = request.query_params.get("token")
@@ -435,69 +335,54 @@ async def sms_webhook(request: Request):
 
     shop = shops[token]
 
-    user_msg_raw: str = form.get("Body", "") or ""
-    user_msg = user_msg_raw.strip()
-    user_msg_lower = user_msg.lower()
+    body = form.get("Body", "").strip()
     media_url = form.get("MediaUrl0")
-    from_phone = form.get("From", "").strip() or "unknown"
+    phone = form.get("From", "")
 
-    # 1) First touch / greeting
-    if not media_url and user_msg_lower in ("", "hi", "hello", "hey", "start"):
-        twiml = send_welcome(shop)
-        return PlainTextResponse(twiml, media_type="application/xml")
+    # 1 — welcome
+    if not media_url and body.lower() in ("", "hi", "hello", "hey"):
+        return PlainTextResponse(welcome_msg(shop), media_type="application/xml")
 
-    # 2) User sends image(s) → run AI damage analysis
+    # 2 — image → analyze
     if media_url:
         try:
             img64 = fetch_image_as_base64(media_url)
             analysis = analyze_damage(img64, shop)
-            save_analysis(token, from_phone, analysis)
-            twiml = send_damage_analysis(shop, analysis)
-            return PlainTextResponse(twiml, media_type="application/xml")
-        except Exception:
+            save_analysis(token, phone, analysis)
+            return PlainTextResponse(damage_msg(shop, analysis), media_type="application/xml")
+        except Exception as e:
+            err = MessagingResponse()
+            err.message("⚠️ Could not analyze the image. Please send another angle.")
+            return PlainTextResponse(str(err), media_type="application/xml")
+
+    # 3 — confirm analysis
+    if body == "1":
+        a = load_latest_analysis(token, phone)
+        if not a:
             msg = MessagingResponse()
-            msg.message(
-                "⚠️ There was an issue analyzing the image. "
-                "Please try sending a clearer photo or a different angle."
-            )
+            msg.message("Please resend the photos.")
             return PlainTextResponse(str(msg), media_type="application/xml")
+        return PlainTextResponse(full_estimate_msg(shop, a), media_type="application/xml")
 
-    # 3) User confirms analysis is correct → send full estimate
-    if user_msg_lower == "1":
-        last_analysis = get_latest_analysis(token, from_phone)
-        if not last_analysis:
-            msg = MessagingResponse()
-            msg.message(
-                "I couldn’t find the last estimate in the system. "
-                "Please resend a photo so I can re-analyze the damage."
-            )
-            return PlainTextResponse(str(msg), media_type="application/xml")
+    # 4 — more photos
+    if body == "2":
+        msg = MessagingResponse()
+        msg.message("Please send more photos.")
+        return PlainTextResponse(str(msg), media_type="application/xml")
 
-        twiml = send_full_estimate(shop, last_analysis)
-        return PlainTextResponse(twiml, media_type="application/xml")
-
-    # 4) User wants to upload more photos
-    if user_msg_lower == "2":
-        twiml = ask_for_more_photos()
-        return PlainTextResponse(twiml, media_type="application/xml")
-
-    # 5) Assume they’re trying to book
-    last_analysis = get_latest_analysis(token, from_phone)
-    booking_data = parse_booking_details(user_msg_raw, last_analysis)
-
-    if booking_data:
+    # 5 — booking
+    a = load_latest_analysis(token, phone)
+    if a:
         try:
-            create_calendar_event(shop, booking_data, last_analysis)
-            twiml = confirm_booking()
-            return PlainTextResponse(twiml, media_type="application/xml")
+            booking = parse_booking_info(body, a)
+            create_calendar_event(shop, booking, a)
+            return PlainTextResponse(booked_msg(), media_type="application/xml")
         except Exception:
             msg = MessagingResponse()
-            msg.message(
-                "⚠️ I had trouble booking that appointment. "
-                "Please double-check your date/time format or try again."
-            )
+            msg.message("⚠️ Could not process booking. Check formatting.")
             return PlainTextResponse(str(msg), media_type="application/xml")
 
-    # 6) Fallback
-    twiml = generic_confusion()
-    return PlainTextResponse(twiml, media_type="application/xml")
+    # 6 — fallback
+    msg = MessagingResponse()
+    msg.message("Please send vehicle photos to begin your estimate.")
+    return PlainTextResponse(str(msg), media_type="application/xml")
