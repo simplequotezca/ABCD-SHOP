@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
-from openai import OpenAI
+import openai  # <= classic client
 
 from sqlalchemy import (
     create_engine,
@@ -35,7 +35,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
 # ============================================================
 # DATABASE (POSTGRES / SQLALCHEMY)
@@ -57,10 +57,6 @@ Base = declarative_base()
 class EstimateSession(Base):
     """
     Stores the latest AI analysis per (shop_token, phone).
-    This lets us:
-    - Show analysis when user sends photos
-    - On '1', pull the saved analysis and send full estimate
-    - On booking, attach the analysis into the calendar event
     """
     __tablename__ = "estimate_sessions"
 
@@ -92,36 +88,6 @@ class ShopConfig(BaseModel):
 
 
 def load_shops() -> Dict[str, ShopConfig]:
-    """
-    SHOPS_JSON example:
-
-    [
-      {
-        "id": "miss",
-        "name": "Mississauga Collision Centre",
-        "webhook_token": "shop_miss_123",
-        "calendar_id": "shiran.bookings@gmail.com",
-        "pricing": {
-          "labor_rates": {
-            "body": 95,
-            "paint": 105
-          },
-          "materials_rate": 38,
-          "base_floor": {
-            "minor_min": 350,
-            "minor_max": 650,
-            "moderate_min": 900,
-            "moderate_max": 1600,
-            "severe_min": 2000,
-            "severe_max": 5000
-          }
-        },
-        "hours": {
-          "monday": {"open": "09:00", "close": "17:00"}
-        }
-      }
-    ]
-    """
     raw = os.getenv("SHOPS_JSON")
     if not raw:
         raise RuntimeError("SHOPS_JSON env variable missing!")
@@ -136,10 +102,6 @@ shops = load_shops()
 # ============================================================
 
 def get_calendar_service():
-    """
-    Requires GOOGLE_SERVICE_ACCOUNT_JSON env var.
-    You must share each shop's calendar with the service account email.
-    """
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw_json:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
@@ -158,23 +120,15 @@ def get_calendar_service():
 # ============================================================
 
 def fetch_image_as_base64(url: str) -> str:
-    """
-    Download image from Twilio and convert to base64.
-    """
     resp = requests.get(url)
     resp.raise_for_status()
     return base64.b64encode(resp.content).decode("utf-8")
 
 
 def safe_json_parse(raw: str) -> Any:
-    """
-    Handle cases where the model wraps JSON in ```json ... ```
-    """
     text = raw.strip()
     if text.startswith("```"):
-        # strip first ```
         parts = text.split("```")
-        # usually ['', 'json\n{...}', '']
         if len(parts) >= 2:
             text = parts[1]
         text = text.lstrip("json").strip()
@@ -185,17 +139,6 @@ def safe_json_parse(raw: str) -> Any:
 # ============================================================
 
 def analyze_damage(image_base64: str, shop: ShopConfig) -> Dict[str, Any]:
-    """
-    Calls OpenAI vision to analyze vehicle damage with pricing context.
-    Must return a JSON dict with:
-    - damage_summary (string)
-    - areas (list of strings)
-    - damage_types (list of strings)
-    - severity ("minor" | "moderate" | "severe")
-    - recommended_labor_hours (number)
-    - estimated_cost_min (number)
-    - estimated_cost_max (number)
-    """
     pricing = json.dumps(shop.pricing, indent=2)
 
     prompt = f"""
@@ -228,7 +171,7 @@ Return ONLY valid JSON with:
 - "estimated_cost_max": number
 """
 
-    resp = client.chat.completions.create(
+    resp = openai.ChatCompletion.create(
         model="gpt-4o-mini",
         messages=[
             {
@@ -251,7 +194,7 @@ Return ONLY valid JSON with:
         temperature=0.1,
     )
 
-    raw = resp.choices[0].message.content
+    raw = resp["choices"][0]["message"]["content"]
     return safe_json_parse(raw)
 
 # ============================================================
@@ -259,18 +202,6 @@ Return ONLY valid JSON with:
 # ============================================================
 
 def parse_booking_details(user_text: str, last_analysis: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Take freeform text (name, phone, email, date/time in ANY order)
-    and convert into structured JSON:
-    {
-      "name": "...",
-      "phone": "...",
-      "email": "...",
-      "datetime_iso": "2025-11-30T14:30:00",
-      "notes": "..."
-    }
-    Returns None if parse fails.
-    """
     analysis_summary = ""
     if last_analysis:
         analysis_summary = last_analysis.get("damage_summary", "")
@@ -281,8 +212,10 @@ You are converting a customer's message into structured booking info for an auto
 Customer message:
 \"\"\"{user_text}\"\"\"
 
+
 Latest damage estimate summary:
 \"\"\"{analysis_summary}\"\"\"
+
 
 Rules:
 - Guess reasonable formatting if needed.
@@ -298,7 +231,7 @@ Return ONLY valid JSON with keys:
 """
 
     try:
-        resp = client.chat.completions.create(
+        resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You output only JSON. No extra text."},
@@ -306,9 +239,8 @@ Return ONLY valid JSON with keys:
             ],
             temperature=0.1,
         )
-        raw = resp.choices[0].message.content
+        raw = resp["choices"][0]["message"]["content"]
         data = safe_json_parse(raw)
-        # basic validation
         if not data.get("datetime_iso"):
             return None
         return data
@@ -497,7 +429,6 @@ async def sms_webhook(request: Request):
     """
     form = await request.form()
 
-    # token is passed as query parameter in the Twilio webhook URL
     token = request.query_params.get("token")
     if not token or token not in shops:
         return PlainTextResponse("Invalid token", status_code=401)
@@ -523,7 +454,7 @@ async def sms_webhook(request: Request):
             save_analysis(token, from_phone, analysis)
             twiml = send_damage_analysis(shop, analysis)
             return PlainTextResponse(twiml, media_type="application/xml")
-        except Exception as e:
+        except Exception:
             msg = MessagingResponse()
             msg.message(
                 "⚠️ There was an issue analyzing the image. "
@@ -550,8 +481,7 @@ async def sms_webhook(request: Request):
         twiml = ask_for_more_photos()
         return PlainTextResponse(twiml, media_type="application/xml")
 
-    # 5) Assume they’re trying to book (free-form message with details)
-    #    Use AI to parse booking info + attach last analysis into calendar.
+    # 5) Assume they’re trying to book
     last_analysis = get_latest_analysis(token, from_phone)
     booking_data = parse_booking_details(user_msg_raw, last_analysis)
 
@@ -560,7 +490,7 @@ async def sms_webhook(request: Request):
             create_calendar_event(shop, booking_data, last_analysis)
             twiml = confirm_booking()
             return PlainTextResponse(twiml, media_type="application/xml")
-        except Exception as e:
+        except Exception:
             msg = MessagingResponse()
             msg.message(
                 "⚠️ I had trouble booking that appointment. "
@@ -568,6 +498,6 @@ async def sms_webhook(request: Request):
             )
             return PlainTextResponse(str(msg), media_type="application/xml")
 
-    # 6) Fallback if we couldn’t understand message
+    # 6) Fallback
     twiml = generic_confusion()
     return PlainTextResponse(twiml, media_type="application/xml")
