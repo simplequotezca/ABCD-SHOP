@@ -14,7 +14,7 @@ email-validator==2.2.0
 twilio==9.2.3
 
 # --- OpenAI (LATEST Stable) ---
-openai==1.51.0
+openai==0.28.1
 
 # --- Database / ORM ---
 SQLAlchemy==2.0.31
