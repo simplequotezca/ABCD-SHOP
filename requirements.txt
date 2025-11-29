@@ -2,15 +2,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 twilio
-openai==1.3.5
-
-# Google Calendar + Auth
+openai>=1.0.0
 google-api-python-client
 google-auth
 google-auth-httplib2
 google-auth-oauthlib
-google-auth-transport-requests
-google-api-core
-
-# For safer HTTP requests (OpenAI + Google)
-requests
