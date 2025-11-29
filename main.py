@@ -1,503 +1,573 @@
 import os
 import json
+import uuid
 import base64
-import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, Optional
 
+import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
 
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Text,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from google.oauth2 import service_account
-
-from urllib.request import Request as URLRequest, urlopen
-from urllib.error import URLError, HTTPError
 
 # ============================================================
-# Logging
-# ============================================================
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("auto-estimator")
-
-# ============================================================
-# Environment / Config
-# ============================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-SHOPS_JSON = os.getenv("SHOPS_JSON")
-
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-
-if not SHOPS_JSON:
-    # Minimal default config so the app can still boot for health checks
-    logger.warning("SHOPS_JSON not set – using a default demo shop config.")
-    SHOPS_CONFIG: List[Dict[str, Any]] = [
-        {
-            "id": "demo",
-            "name": "Demo Collision Centre",
-            "webhook_token": "demo_token_123",
-            "calendar_id": None,
-        }
-    ]
-else:
-    try:
-        SHOPS_CONFIG = json.loads(SHOPS_JSON)
-    except json.JSONDecodeError:
-        logger.exception("Failed to parse SHOPS_JSON, falling back to demo shop.")
-        SHOPS_CONFIG = [
-            {
-                "id": "demo",
-                "name": "Demo Collision Centre",
-                "webhook_token": "demo_token_123",
-                "calendar_id": None,
-            }
-        ]
-
-# Map webhook token -> shop dict for quick lookup
-SHOPS_BY_TOKEN: Dict[str, Dict[str, Any]] = {
-    shop["webhook_token"]: shop for shop in SHOPS_CONFIG if "webhook_token" in shop
-}
-
-# In-memory sessions for simple booking flow (ok for demo, not for production scale)
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-# OpenAI client
-client: Optional[OpenAI] = None
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    logger.warning("OPENAI_API_KEY is not set – AI estimator will be disabled.")
-
-# ============================================================
-# Google Calendar helpers
-# ============================================================
-
-_calendar_service: Optional[Any] = None
-
-
-def get_calendar_service() -> Optional[Any]:
-    """
-    Lazily create and cache a Google Calendar service using a service account.
-    Returns None if credentials are missing or misconfigured.
-    """
-    global _calendar_service
-
-    if _calendar_service is not None:
-        return _calendar_service
-
-    creds_info: Optional[Dict[str, Any]] = None
-
-    try:
-        if GOOGLE_SERVICE_ACCOUNT_JSON:
-            creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        elif GOOGLE_SERVICE_ACCOUNT_FILE and os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
-            with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
-                creds_info = json.load(f)
-
-        if not creds_info:
-            logger.info("Google service account not configured – calendar booking disabled.")
-            return None
-
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/calendar"],
-        )
-        _calendar_service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-        logger.info("Google Calendar service initialized.")
-        return _calendar_service
-    except Exception:
-        logger.exception("Failed to initialize Google Calendar service.")
-        _calendar_service = None
-        return None
-
-
-def create_calendar_booking(
-    shop: Dict[str, Any],
-    booking: Dict[str, Any],
-    from_phone: str,
-) -> bool:
-    """
-    Create a calendar event for the booking.
-    Returns True if the event was created successfully, False otherwise.
-    """
-    calendar_id = shop.get("calendar_id")
-    if not calendar_id:
-        logger.info("Shop %s has no calendar_id configured.", shop.get("id"))
-        return False
-
-    service = get_calendar_service()
-    if not service:
-        return False
-
-    start_dt: datetime = booking["datetime"]
-    end_dt = start_dt + timedelta(hours=1)
-
-    description_lines = [
-        "Auto body appointment from SMS.",
-        f"Shop: {shop.get('name')}",
-        f"Name: {booking.get('name')}",
-        f"Phone: {from_phone}",
-        f"Email: {booking.get('email')}",
-        f"Vehicle: {booking.get('vehicle')}",
-        f"Requested time (local): {start_dt.isoformat()}",
-    ]
-    description = "\n".join(description_lines)
-
-    event_body = {
-        "summary": f"Collision Inspection – {booking.get('name')}",
-        "description": description,
-        "start": {"dateTime": start_dt.isoformat()},
-        "end": {"dateTime": end_dt.isoformat()},
-    }
-
-    try:
-        service.events().insert(calendarId=calendar_id, body=event_body, sendUpdates="all").execute()
-        logger.info("Created calendar event for shop %s at %s", shop.get("id"), start_dt)
-        return True
-    except Exception:
-        logger.exception("Error creating Google Calendar event.")
-        return False
-
-
-# ============================================================
-# Image helpers
-# ============================================================
-
-
-def download_twilio_image_as_base64(url: str) -> Optional[str]:
-    """
-    Download an image from a Twilio MediaUrl using basic auth and return a base64 string.
-    Returns None on failure.
-    """
-    if not url:
-        return None
-
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-        logger.error("Twilio credentials not set – cannot download media.")
-        return None
-
-    try:
-        auth_str = f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}"
-        auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("ascii")
-
-        req = URLRequest(url)
-        req.add_header("Authorization", f"Basic {auth_b64}")
-
-        with urlopen(req, timeout=15) as resp:
-            data = resp.read()
-
-        if not data:
-            logger.error("No data received when downloading Twilio media.")
-            return None
-
-        img_b64 = base64.b64encode(data).decode("ascii")
-        return img_b64
-    except (HTTPError, URLError) as e:
-        logger.exception("Network error downloading Twilio image: %s", e)
-        return None
-    except Exception:
-        logger.exception("Unexpected error downloading Twilio image.")
-        return None
-
-
-# ============================================================
-# AI Damage Estimator
-# ============================================================
-
-
-async def run_damage_estimator(shop: Dict[str, Any], media_urls: List[str]) -> str:
-    """
-    Call OpenAI vision model on the uploaded images and return a human-readable estimate string.
-    """
-    if not client:
-        return (
-            "Our AI estimator is temporarily unavailable. "
-            "Please reply with a brief description of the damage and the shop will follow up manually."
-        )
-
-    image_contents: List[Dict[str, Any]] = []
-    for url in media_urls:
-        img_b64 = download_twilio_image_as_base64(url)
-        if img_b64:
-            image_contents.append(
-                {
-                    "type": "input_image",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                }
-            )
-
-    if not image_contents:
-        logger.warning("No valid images could be downloaded from Twilio media URLs.")
-        return (
-            "Sorry, our AI estimator had an issue reading the photos this time.\n\n"
-            "Please reply with a brief description of the damage, and the shop can follow up manually.\n\n"
-            "You can also reply with BOOK to schedule a FREE in-person inspection."
-        )
-
-    shop_name = shop.get("name", "the shop")
-
-    system_prompt = (
-        "You are an experienced auto body damage estimator in Ontario, Canada (2025). "
-        "You will be shown 1–5 photos of a damaged vehicle. "
-        "Your job is to:\n"
-        "1) Identify which areas of the vehicle are damaged.\n"
-        "2) Classify overall severity as Minor, Moderate, or Severe.\n"
-        "3) Provide a realistic cost range in CAD for Ontario collision repair shops.\n"
-        "4) Explain in plain language what repairs are likely required.\n"
-        "5) Add a disclaimer that this is a preliminary visual estimate, not a final invoice.\n\n"
-        "Use concise bullet points. Never invent unrelated damage. If photos are unclear, say so."
-    )
-
-    user_text = (
-        f"Customer has texted photos of collision damage for {shop_name}.\n\n"
-        "Based ONLY on these images, provide:\n"
-        "- Severity (Minor / Moderate / Severe)\n"
-        "- Estimated cost range in CAD\n"
-        "- Key damaged areas and likely repairs\n"
-        "- Any safety concerns (e.g., airbags, frame, alignment)\n"
-        "- Short, friendly explanation for the customer.\n\n"
-        "Respond in this format:\n"
-        "Severity: <Minor/Moderate/Severe>\n"
-        "Estimated Cost (Ontario 2025): $X – $Y\n"
-        "Areas: <list>\n"
-        "Damage Types: <list>\n\n"
-        "<2–4 short bullet points explaining reasoning and next steps.>\n\n"
-        "End with: 'This is a visual, preliminary estimate and not a final repair bill.'"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": user_text}] + image_contents,
-        },
-    ]
-
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.3,
-        )
-        estimate_text = completion.choices[0].message.content.strip()
-        logger.info("AI damage estimate generated successfully.")
-        return estimate_text
-    except Exception as e:
-        logger.exception("Error during OpenAI damage estimation: %s", e)
-        return (
-            f"AI Damage Estimate for {shop_name}:\n\n"
-            "Sorry, our AI estimator had an issue analyzing the photos this time.\n\n"
-            "Please reply with a brief description of the damage, and the shop can follow up manually.\n\n"
-            "You can also reply with BOOK to schedule a FREE in-person inspection."
-        )
-
-
-# ============================================================
-# Booking Flow
-# ============================================================
-
-
-def start_booking_session(from_phone: str, shop: Dict[str, Any]) -> str:
-    SESSIONS[from_phone] = {
-        "state": "booking_name",
-        "shop_id": shop.get("id"),
-        "started_at": datetime.utcnow().isoformat(),
-    }
-    return (
-        f"Great! Let's schedule a FREE in-person inspection at {shop.get('name')}.\n\n"
-        "First, what's your full name?"
-    )
-
-
-def handle_booking_step(from_phone: str, body: str, shop: Dict[str, Any]) -> Optional[str]:
-    session = SESSIONS.get(from_phone)
-    if not session:
-        return None
-
-    state = session.get("state")
-
-    if state == "booking_name":
-        session["name"] = body.strip()
-        session["state"] = "booking_vehicle"
-        return (
-            f"Thanks {session['name']}!\n\n"
-            "What vehicle will you be bringing in (year, make, model, colour)?"
-        )
-
-    if state == "booking_vehicle":
-        session["vehicle"] = body.strip()
-        session["state"] = "booking_email"
-        return "Got it. What's the best email for your booking confirmation?"
-
-    if state == "booking_email":
-        session["email"] = body.strip()
-        session["state"] = "booking_datetime"
-        return (
-            "Perfect.\n\n"
-            "Lastly, what date and time work best for you?\n"
-            "Please reply in this format: YYYY-MM-DD HH:MM (for example 2025-12-01 14:30)."
-        )
-
-    if state == "booking_datetime":
-        raw = body.strip()
-        try:
-            appt_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
-        except ValueError:
-            return (
-                "I couldn't read that date/time.\n"
-                "Please use this format: YYYY-MM-DD HH:MM (for example 2025-12-01 14:30)."
-            )
-
-        session["datetime"] = appt_dt
-        session["datetime_raw"] = raw
-
-        success = create_calendar_booking(shop, session, from_phone)
-        pretty = appt_dt.strftime("%A, %B %d at %I:%M %p")
-
-        # Clear session
-        SESSIONS.pop(from_phone, None)
-
-        if success:
-            return (
-                f"You're all set! We've booked you in for {pretty} at {shop.get('name')}.\n\n"
-                "You'll receive a confirmation from the shop if any changes are needed."
-            )
-        else:
-            return (
-                f"Thanks! We've recorded your preferred time ({pretty}) and details.\n\n"
-                f"{shop.get('name')} will contact you to confirm your appointment."
-            )
-
-    # Unknown state – reset session
-    logger.warning("Unknown booking state for %s, resetting session.", from_phone)
-    SESSIONS.pop(from_phone, None)
-    return (
-        f"Something went wrong with your booking at {shop.get('name')}.\n"
-        "Please reply with BOOK to start again."
-    )
-
-
-def handle_text_message(shop: Dict[str, Any], from_phone: str, body: str) -> str:
-    """
-    Handle non-image messages: greeting, BOOK flow, or fallback help.
-    """
-    body_clean = (body or "").strip()
-    body_lower = body_clean.lower()
-
-    # If user is mid-booking, advance that flow
-    if from_phone in SESSIONS:
-        maybe_reply = handle_booking_step(from_phone, body_clean, shop)
-        if maybe_reply:
-            return maybe_reply
-
-    # Start booking flow
-    if body_lower == "book" or body_lower.startswith("book "):
-        return start_booking_session(from_phone, shop)
-
-    # Default info / greeting
-    return (
-        f"Hi there! Thanks for reaching out to {shop.get('name')}.\n\n"
-        "You can:\n"
-        "• Text photos of the damage for a fast AI-powered estimate, or\n"
-        "• Reply with BOOK to schedule a FREE in-person inspection."
-    )
-
-
-# ============================================================
-# FastAPI App + Twilio Webhook
+# FASTAPI + OPENAI SETUP
 # ============================================================
 
 app = FastAPI()
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
-@app.get("/")
-async def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "shops_loaded": len(SHOPS_BY_TOKEN),
-        "has_openai": bool(client),
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ============================================================
+# DATABASE (POSTGRES / SQLALCHEMY)
+# ============================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is required")
+
+# Fix old postgres:// format if needed
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class EstimateSession(Base):
+    """
+    Stores the latest AI analysis per (shop_token, phone).
+    This lets us:
+    - Show analysis when user sends photos
+    - On '1', pull the saved analysis and send full estimate
+    - On booking, attach the analysis into the calendar event
+    """
+    __tablename__ = "estimate_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_token = Column(String(100), index=True)
+    phone = Column(String(50), index=True)
+    analysis_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow
+    )
+
+
+Base.metadata.create_all(bind=engine)
+
+# ============================================================
+# MULTI-SHOP CONFIG (FROM SHOPS_JSON ENV)
+# ============================================================
+
+class ShopConfig(BaseModel):
+    id: str
+    name: str
+    webhook_token: str
+    calendar_id: str
+    pricing: Dict[str, Any]
+    hours: Dict[str, Any]
+
+
+def load_shops() -> Dict[str, ShopConfig]:
+    """
+    SHOPS_JSON example:
+
+    [
+      {
+        "id": "miss",
+        "name": "Mississauga Collision Centre",
+        "webhook_token": "shop_miss_123",
+        "calendar_id": "shiran.bookings@gmail.com",
+        "pricing": {
+          "labor_rates": {
+            "body": 95,
+            "paint": 105
+          },
+          "materials_rate": 38,
+          "base_floor": {
+            "minor_min": 350,
+            "minor_max": 650,
+            "moderate_min": 900,
+            "moderate_max": 1600,
+            "severe_min": 2000,
+            "severe_max": 5000
+          }
+        },
+        "hours": {
+          "monday": {"open": "09:00", "close": "17:00"}
+        }
+      }
+    ]
+    """
+    raw = os.getenv("SHOPS_JSON")
+    if not raw:
+        raise RuntimeError("SHOPS_JSON env variable missing!")
+    data = json.loads(raw)
+    return {shop["webhook_token"]: ShopConfig(**shop) for shop in data}
+
+
+shops = load_shops()
+
+# ============================================================
+# GOOGLE CALENDAR SERVICE
+# ============================================================
+
+def get_calendar_service():
+    """
+    Requires GOOGLE_SERVICE_ACCOUNT_JSON env var.
+    You must share each shop's calendar with the service account email.
+    """
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw_json:
+        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
+
+    info = json.loads(raw_json)
+
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    service = build("calendar", "v3", credentials=creds)
+    return service
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def fetch_image_as_base64(url: str) -> str:
+    """
+    Download image from Twilio and convert to base64.
+    """
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
+def safe_json_parse(raw: str) -> Any:
+    """
+    Handle cases where the model wraps JSON in ```json ... ```
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        # strip first ```
+        parts = text.split("```")
+        # usually ['', 'json\n{...}', '']
+        if len(parts) >= 2:
+            text = parts[1]
+        text = text.lstrip("json").strip()
+    return json.loads(text)
+
+# ============================================================
+# AI — DAMAGE ANALYSIS (DRIVER POV, ULTRA ACCURATE)
+# ============================================================
+
+def analyze_damage(image_base64: str, shop: ShopConfig) -> Dict[str, Any]:
+    """
+    Calls OpenAI vision to analyze vehicle damage with pricing context.
+    Must return a JSON dict with:
+    - damage_summary (string)
+    - areas (list of strings)
+    - damage_types (list of strings)
+    - severity ("minor" | "moderate" | "severe")
+    - recommended_labor_hours (number)
+    - estimated_cost_min (number)
+    - estimated_cost_max (number)
+    """
+    pricing = json.dumps(shop.pricing, indent=2)
+
+    prompt = f"""
+You are an elite automotive collision damage estimator in Ontario, Canada.
+You MUST analyze damage strictly from the driver's point of view:
+- "driver side" = left side
+- "passenger side" = right side
+
+Use this pricing context:
+{pricing}
+
+Instructions:
+1. Identify all damaged panels and parts (bumper, fender, hood, trunk, doors, lights, etc.).
+2. Describe severity and type of damage (scratches, scuffs, dents, deep dents, cracks, deformation, structural).
+3. Classify overall severity as one of: "minor", "moderate", "severe".
+4. Estimate realistic labor hours, considering body and paint.
+5. Estimate cost range in CAD using shop pricing and this severity baseline:
+   - minor: 350–650
+   - moderate: 900–1600
+   - severe: 2000–5000+
+6. Be conservative but realistic. This is a visual PRELIMINARY estimate.
+
+Return ONLY valid JSON with:
+- "damage_summary": string
+- "areas": string[]
+- "damage_types": string[]
+- "severity": "minor" | "moderate" | "severe"
+- "recommended_labor_hours": number
+- "estimated_cost_min": number
+- "estimated_cost_max": number
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a professional auto body collision estimator. You output strict JSON, no explanations."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    }
+                ]
+            },
+        ],
+        temperature=0.1,
+    )
+
+    raw = resp.choices[0].message.content
+    return safe_json_parse(raw)
+
+# ============================================================
+# AI — BOOKING PARSER (FREE TEXT → STRUCTURED INFO)
+# ============================================================
+
+def parse_booking_details(user_text: str, last_analysis: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Take freeform text (name, phone, email, date/time in ANY order)
+    and convert into structured JSON:
+    {
+      "name": "...",
+      "phone": "...",
+      "email": "...",
+      "datetime_iso": "2025-11-30T14:30:00",
+      "notes": "..."
+    }
+    Returns None if parse fails.
+    """
+    analysis_summary = ""
+    if last_analysis:
+        analysis_summary = last_analysis.get("damage_summary", "")
+
+    prompt = f"""
+You are converting a customer's message into structured booking info for an auto body shop.
+
+Customer message:
+\"\"\"{user_text}\"\"\"
+
+Latest damage estimate summary:
+\"\"\"{analysis_summary}\"\"\"
+
+Rules:
+- Guess reasonable formatting if needed.
+- The datetime must be in ISO-8601 local time for America/Toronto (e.g. "2025-11-30T14:30:00").
+- If you cannot find a field, put an empty string "" for that field.
+
+Return ONLY valid JSON with keys:
+- name (string)
+- phone (string)
+- email (string)
+- datetime_iso (string, ISO-8601)
+- notes (string)
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You output only JSON. No extra text."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content
+        data = safe_json_parse(raw)
+        # basic validation
+        if not data.get("datetime_iso"):
+            return None
+        return data
+    except Exception:
+        return None
+
+# ============================================================
+# DB HELPERS
+# ============================================================
+
+def save_analysis(shop_token: str, phone: str, analysis: Dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        record = EstimateSession(
+            shop_token=shop_token,
+            phone=phone,
+            analysis_json=json.dumps(analysis),
+        )
+        db.add(record)
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_latest_analysis(shop_token: str, phone: str) -> Optional[Dict[str, Any]]:
+    db = SessionLocal()
+    try:
+        rec = (
+            db.query(EstimateSession)
+            .filter(
+                EstimateSession.shop_token == shop_token,
+                EstimateSession.phone == phone,
+            )
+            .order_by(EstimateSession.created_at.desc())
+            .first()
+        )
+        if not rec:
+            return None
+        return json.loads(rec.analysis_json)
+    finally:
+        db.close()
+
+# ============================================================
+# MESSAGE BUILDERS (TWILIO FLOW)
+# ============================================================
+
+def send_welcome(shop: ShopConfig) -> str:
+    msg = MessagingResponse()
+    msg.message(
+        f"👋 Welcome to *{shop.name}!* \n\n"
+        "To get a fast AI estimate, please send *1–3 clear photos* of the damage "
+        "from a few angles (close and far)."
+    )
+    return str(msg)
+
+
+def send_damage_analysis(shop: ShopConfig, analysis: Dict[str, Any]) -> str:
+    msg = MessagingResponse()
+    msg.message(
+        f"🔍 *AI Damage Analysis*\n"
+        f"{analysis['damage_summary']}\n\n"
+        f"Areas: {', '.join(analysis.get('areas', []))}\n"
+        f"Damage Types: {', '.join(analysis.get('damage_types', []))}\n"
+        f"Severity: *{analysis.get('severity', '').title()}*\n\n"
+        "If this looks correct, reply *1*.\n"
+        "If you’d like to upload more photos, reply *2*."
+    )
+    return str(msg)
+
+
+def send_full_estimate(shop: ShopConfig, analysis: Dict[str, Any]) -> str:
+    estimate_id = str(uuid.uuid4())
+    cost_min = analysis.get("estimated_cost_min")
+    cost_max = analysis.get("estimated_cost_max")
+    hours = analysis.get("recommended_labor_hours")
+
+    msg = MessagingResponse()
+    msg.message(
+        f"📘 *Full Estimate Breakdown* (ID: {estimate_id})\n\n"
+        f"Estimated Cost Range (visual estimate): "
+        f"${cost_min} – ${cost_max} CAD\n"
+        f"Recommended Labor Hours: ~{hours} hours\n\n"
+        "This is a preliminary AI estimate based on the photos and may be adjusted "
+        "after an in-person inspection.\n\n"
+        "📅 To book an appointment, please reply in ONE message with your:\n"
+        "- Full Name\n"
+        "- Phone Number\n"
+        "- Email\n"
+        "- Preferred Date & Time\n\n"
+        "You can send it in any order. We’ll confirm your spot and notify the shop instantly."
+    )
+    return str(msg)
+
+
+def confirm_booking() -> str:
+    msg = MessagingResponse()
+    msg.message(
+        "✅ Your appointment request has been received and added to our schedule.\n\n"
+        "A team member from the shop will reach out if any adjustments are needed. "
+        "Thank you!"
+    )
+    return str(msg)
+
+
+def ask_for_more_photos() -> str:
+    msg = MessagingResponse()
+    msg.message("No problem at all! 📸\nPlease upload a few more clear photos of the damage.")
+    return str(msg)
+
+
+def generic_confusion() -> str:
+    msg = MessagingResponse()
+    msg.message(
+        "Sorry, I didn’t quite catch that.\n\n"
+        "👉 To continue:\n"
+        "- Send *photos* of the damage for an AI estimate, or\n"
+        "- If you've already received an estimate, reply *1* to see the full breakdown, or\n"
+        "- Reply with your *name, phone, email, and preferred date/time* to book."
+    )
+    return str(msg)
+
+# ============================================================
+# CALENDAR EVENT CREATION
+# ============================================================
+
+def create_calendar_event(shop: ShopConfig, booking: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> None:
+    service = get_calendar_service()
+
+    description_lines = [
+        f"Name: {booking.get('name', '')}",
+        f"Phone: {booking.get('phone', '')}",
+        f"Email: {booking.get('email', '')}",
+        "",
+        "Customer Notes:",
+        booking.get("notes", ""),
+        "",
+        "AI Visual Estimate:",
+    ]
+
+    if analysis:
+        description_lines.append(analysis.get("damage_summary", ""))
+        description_lines.append("")
+        description_lines.append(f"Areas: {', '.join(analysis.get('areas', []))}")
+        description_lines.append(f"Damage Types: {', '.join(analysis.get('damage_types', []))}")
+        description_lines.append(f"Severity: {analysis.get('severity', '').title()}")
+        description_lines.append(
+            f"Est. Cost: ${analysis.get('estimated_cost_min')} – ${analysis.get('estimated_cost_max')} CAD"
+        )
+        description_lines.append(
+            f"Recommended Labor Hours: {analysis.get('recommended_labor_hours')}"
+        )
+
+    description = "\n".join(description_lines)
+
+    start_dt = booking["datetime_iso"]
+    start = datetime.fromisoformat(start_dt)
+    end = start + timedelta(hours=1)
+
+    event = {
+        "summary": f"AI Estimate Booking — {booking.get('name', 'Customer')}",
+        "description": description,
+        "start": {
+            "dateTime": start.isoformat(),
+            "timeZone": "America/Toronto",
+        },
+        "end": {
+            "dateTime": end.isoformat(),
+            "timeZone": "America/Toronto",
+        },
     }
 
+    service.events().insert(
+        calendarId=shop.calendar_id,
+        body=event
+    ).execute()
+
+# ============================================================
+# MAIN TWILIO WEBHOOK
+# ============================================================
 
 @app.post("/sms-webhook")
 async def sms_webhook(request: Request):
     """
-    Twilio SMS/MMS webhook.
-    Expects a query parameter ?token=shop_xxx to identify the shop.
+    Twilio webhook URL pattern:
+    https://your-app-url/sms-webhook?token=shop_miss_123
     """
+    form = await request.form()
+
+    # token is passed as query parameter in the Twilio webhook URL
     token = request.query_params.get("token")
-    shop = SHOPS_BY_TOKEN.get(token)
+    if not token or token not in shops:
+        return PlainTextResponse("Invalid token", status_code=401)
 
-    resp = MessagingResponse()
+    shop = shops[token]
 
-    if not shop:
-        logger.error("Invalid or missing shop token: %s", token)
-        resp.message(
-            "This number is not configured correctly. Please contact the shop directly."
-        )
-        return Response(str(resp), media_type="application/xml")
+    user_msg_raw: str = form.get("Body", "") or ""
+    user_msg = user_msg_raw.strip()
+    user_msg_lower = user_msg.lower()
+    media_url = form.get("MediaUrl0")
+    from_phone = form.get("From", "").strip() or "unknown"
 
-    try:
-        form = await request.form()
-    except Exception:
-        logger.exception("Failed to parse incoming Twilio form data.")
-        resp.message(
-            "Sorry, we couldn't read your message. Please try again or contact the shop directly."
-        )
-        return Response(str(resp), media_type="application/xml")
+    # 1) First touch / greeting
+    if not media_url and user_msg_lower in ("", "hi", "hello", "hey", "start"):
+        twiml = send_welcome(shop)
+        return PlainTextResponse(twiml, media_type="application/xml")
 
-    from_phone = form.get("From", "")
-    body = form.get("Body", "") or ""
-    num_media_str = form.get("NumMedia", "0") or "0"
+    # 2) User sends image(s) → run AI damage analysis
+    if media_url:
+        try:
+            img64 = fetch_image_as_base64(media_url)
+            analysis = analyze_damage(img64, shop)
+            save_analysis(token, from_phone, analysis)
+            twiml = send_damage_analysis(shop, analysis)
+            return PlainTextResponse(twiml, media_type="application/xml")
+        except Exception as e:
+            msg = MessagingResponse()
+            msg.message(
+                "⚠️ There was an issue analyzing the image. "
+                "Please try sending a clearer photo or a different angle."
+            )
+            return PlainTextResponse(str(msg), media_type="application/xml")
 
-    try:
-        num_media = int(num_media_str)
-    except ValueError:
-        num_media = 0
+    # 3) User confirms analysis is correct → send full estimate
+    if user_msg_lower == "1":
+        last_analysis = get_latest_analysis(token, from_phone)
+        if not last_analysis:
+            msg = MessagingResponse()
+            msg.message(
+                "I couldn’t find the last estimate in the system. "
+                "Please resend a photo so I can re-analyze the damage."
+            )
+            return PlainTextResponse(str(msg), media_type="application/xml")
 
-    logger.info(
-        "Incoming SMS for shop=%s from=%s body=%r images=%d",
-        shop.get("id"),
-        from_phone,
-        body,
-        num_media,
-    )
+        twiml = send_full_estimate(shop, last_analysis)
+        return PlainTextResponse(twiml, media_type="application/xml")
 
-    try:
-        if num_media > 0:
-            # Collect all media URLs Twilio sent (MediaUrl0..MediaUrlN)
-            media_urls: List[str] = []
-            for i in range(num_media):
-                url = form.get(f"MediaUrl{i}")
-                if url:
-                    media_urls.append(url)
+    # 4) User wants to upload more photos
+    if user_msg_lower == "2":
+        twiml = ask_for_more_photos()
+        return PlainTextResponse(twiml, media_type="application/xml")
 
-            if not media_urls:
-                logger.warning("NumMedia > 0 but no MediaUrl fields found.")
-                resp.message(
-                    "We couldn't read your photos. Please try sending them again, or reply with BOOK to schedule an in-person inspection."
-                )
-            else:
-                estimate_text = await run_damage_estimator(shop, media_urls)
-                full_message = (
-                    f"AI Damage Estimate for {shop.get('name')}:\n\n{estimate_text}"
-                )
-                resp.message(full_message)
-        else:
-            reply_text = handle_text_message(shop, from_phone, body)
-            resp.message(reply_text)
-    except Exception:
-        logger.exception("Unhandled error in sms_webhook.")
-        resp.message(
-            "Sorry, something went wrong while processing your message.\n\n"
-            "Please try again in a few minutes or contact the shop directly."
-        )
+    # 5) Assume they’re trying to book (free-form message with details)
+    #    Use AI to parse booking info + attach last analysis into calendar.
+    last_analysis = get_latest_analysis(token, from_phone)
+    booking_data = parse_booking_details(user_msg_raw, last_analysis)
 
-    return Response(str(resp), media_type="application/xml")
+    if booking_data:
+        try:
+            create_calendar_event(shop, booking_data, last_analysis)
+            twiml = confirm_booking()
+            return PlainTextResponse(twiml, media_type="application/xml")
+        except Exception as e:
+            msg = MessagingResponse()
+            msg.message(
+                "⚠️ I had trouble booking that appointment. "
+                "Please double-check your date/time format or try again."
+            )
+            return PlainTextResponse(str(msg), media_type="application/xml")
+
+    # 6) Fallback if we couldn’t understand message
+    twiml = generic_confusion()
+    return PlainTextResponse(twiml, media_type="application/xml")
