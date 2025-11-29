@@ -4,7 +4,7 @@ python-multipart==0.0.6
 requests==2.31.0
 twilio==8.10.0
 
-# OPENAI — CLASSIC, STABLE, VISION-COMPATIBLE VIA IMAGE URL
+# OpenAI classic client (stable)
 openai==0.28.1
 
 pydantic==2.7.0
@@ -23,6 +23,5 @@ python-dotenv==1.0.1
 Pillow==10.2.0
 email-validator==2.1.0
 
-# FORCE FULL REINSTALL SO RAILWAY STOPS USING CACHED venv
-# (any harmless change will force Railway to rebuild the venv)
+# tiny nudge so Railway rebuilds venv and doesn’t cache old OpenAI
 urllib3==2.2.0
