@@ -206,7 +206,16 @@ async def analyze_damage_with_ai(shop, media_data_urls):
         '  "cost_min": 1200,\n'
         '  "cost_max": 2500,\n'
         '  "panels": ["rear bumper", "trunk lid"],\n'
-        '  "summary": "2–4 sentence explanation for the customer."\n"
+        system_instructions = (
+        "{\n"
+        '  "severity": "minor | moderate | severe",\n'
+        '  "damaged_areas": ["area1", "area2"],\n'
+        '  "damage_types": ["dent", "scratch", "crack"],\n'
+        '  "estimated_cost_min": number,\n'
+        '  "estimated_cost_max": number,\n'
+        '  "labor_hours": number,\n'
+        '  "parts_needed": ["part1", "part2"],\n'
+        '  "summary": "2–4 sentence explanation for the customer."\n'
         "}\n"
         "Do not include any extra keys, comments, or text outside the JSON."
     )
