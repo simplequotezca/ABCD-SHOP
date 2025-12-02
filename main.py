@@ -134,12 +134,12 @@ async def analyze_damage(image_bytes_list: List[bytes]) -> Optional[Dict[str, An
     system_prompt = (
         "You are an auto-body estimator. Return STRICT JSON ONLY:\n\n"
         "{\n"
-        '  "severity": "minor | moderate | severe",\n'
-        '  "estimated_cost_min": number,\n'
-        '  "estimated_cost_max": number,\n'
-        '  "damaged_areas": [list],\n'
-        '  "damage_types": [list],\n'
-        '  "summary": "2–4 sentences"\n'
+        '  \"severity\": \"minor | moderate | severe\",\n'
+        '  \"estimated_cost_min\": number,\n'
+        '  \"estimated_cost_max\": number,\n'
+        '  \"damaged_areas\": [list],\n'
+        '  \"damage_types\": [list],\n'
+        '  \"summary\": \"2–4 sentences\"\n'
         "}"
     )
 
@@ -221,12 +221,7 @@ def parse_booking_message(body: str) -> Dict[str, Any]:
     except Exception:
         preferred_dt = None
 
-    # If we parsed a datetime, remove that portion approximately by keywords
-    # (best-effort; even if not removed it's fine)
-    # For simplicity we'll not over-clean here.
-
     # Remaining text -> name + vehicle guess
-    # After stripping extra spaces and commas
     leftover_tokens = [t for t in re.split(r"[,\n]+|\s{2,}", cleaned) if t.strip()]
     name = None
     vehicle = None
@@ -312,6 +307,17 @@ def log_estimate_lead(shop: ShopConfig, from_number: str, result: Dict[str, Any]
         f"Summary:\n{result.get('summary')}\n\n"
         "Appointment: NOT BOOKED YET"
     )
+
+    # Embed customer photos (if any) into the event description
+    image_urls: List[str] = result.get("image_urls") or []
+    if image_urls:
+        description += "\n\nCustomer Photos:\n"
+        for url in image_urls:
+            description += (
+                f'\n<img src="{url}" '
+                f'style="width:100%;max-width:450px;margin-top:10px;"><br>'
+            )
+
     create_calendar_event(shop, title, description)
 
 def log_booking_event(shop: ShopConfig, from_number: str,
@@ -337,6 +343,8 @@ def log_booking_event(shop: ShopConfig, from_number: str,
         f"Original SMS: {booking.get('raw')}",
     ]
 
+    image_urls: List[str] = []
+
     if last_estimate:
         lines.append("")
         lines.append("AI Estimate:")
@@ -348,6 +356,18 @@ def log_booking_event(shop: ShopConfig, from_number: str,
         lines.append(f"Types: {', '.join(last_estimate.get('damage_types', []))}")
         lines.append("")
         lines.append(last_estimate.get("summary", ""))
+
+        # If we have stored image URLs from the estimate, reuse them here
+        image_urls = last_estimate.get("image_urls") or []
+
+    if image_urls:
+        lines.append("")
+        lines.append("Customer Photos:")
+        for url in image_urls:
+            lines.append(
+                f'<img src="{url}" '
+                f'style="width:100%;max-width:450px;margin-top:10px;">'
+            )
 
     description = "\n".join(lines)
 
@@ -444,12 +464,15 @@ async def sms_webhook(request: Request, token: str):
     # 3) We have images -> run AI pipeline
     # --------------------------------------------------------
 
-    # Download images
+    # Download images + capture public URLs
     images: List[bytes] = []
+    image_urls: List[str] = []
+
     for i in range(num_media):
         url = form.get(f"MediaUrl{i}")
         if not url:
             continue
+        image_urls.append(url)
         try:
             img = await download_twilio_image(url)
             images.append(img)
@@ -473,6 +496,9 @@ async def sms_webhook(request: Request, token: str):
             "To book an appointment, reply: BOOK + your info (any order)."
         )
         return Response(str(reply), media_type="application/xml")
+
+    # Attach image URLs so calendar events can embed photos
+    result["image_urls"] = image_urls
 
     # Store last estimate per phone for later bookings
     LAST_ESTIMATE_BY_PHONE[from_number] = result
