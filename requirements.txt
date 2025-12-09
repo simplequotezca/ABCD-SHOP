@@ -1,0 +1,24 @@
+fastapi==0.110.0
+uvicorn==0.29.0
+python-multipart==0.0.6
+twilio==8.10.0
+openai==1.40.0
+httpx==0.27.0
+python-dateutil==2.9.0.post0
+
+google-api-python-client==2.129.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# DATABASE SUPPORT 
+SQLAlchemy==2.0.29
+psycopg2-binary==2.9.9
+
+pytz==2024.1
+Pillow==10.2.0
+
+# EMAIL
+sendgrid==6.11.0
+
+email-validator==2.1.0.post1
