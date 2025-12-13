@@ -1,0 +1,126 @@
+/* =========================
+   GLOBAL
+========================= */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html, body {
+    height: 100%;
+    width: 100%;
+    font-family: Arial, sans-serif;
+}
+
+/* =========================
+   PAGE BACKGROUND
+========================= */
+
+body {
+    min-height: 100vh;
+    background: linear-gradient(180deg, #0f172a, #020617);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    color: white;
+}
+
+/* =========================
+   MAIN CARD (HERO)
+========================= */
+
+.card {
+    background: #020617;
+    padding: 64px 36px;
+    border-radius: 28px;
+
+    width: 94%;
+    max-width: 520px;
+
+    min-height: 70vh;      /* 🔥 fills screen */
+    max-height: 85vh;
+
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    text-align: center;
+
+    box-shadow: 0 40px 100px rgba(0, 0, 0, 0.7);
+}
+
+/* =========================
+   LOGO
+========================= */
+
+.logo {
+    width: 140px;
+    margin: 0 auto 36px auto;
+}
+
+/* =========================
+   TEXT
+========================= */
+
+h1 {
+    font-size: 26px;
+    margin-bottom: 12px;
+}
+
+p {
+    font-size: 15px;
+    opacity: 0.85;
+    margin-bottom: 32px;
+}
+
+/* =========================
+   CTA BUTTON
+========================= */
+
+button {
+    width: 100%;
+    padding: 16px;
+    font-size: 18px;
+    font-weight: 600;
+
+    border-radius: 14px;
+    border: none;
+
+    background: linear-gradient(90deg, #6366f1, #8b5cf6);
+    color: white;
+
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 30px rgba(99, 102, 241, 0.4);
+}
+
+/* =========================
+   FOOTNOTE
+========================= */
+
+.note {
+    margin-top: 20px;
+    font-size: 12px;
+    opacity: 0.55;
+}
+
+/* =========================
+   SHORT SCREENS (SAFETY)
+========================= */
+
+@media (max-height: 800px) {
+    body {
+        align-items: flex-start;
+        padding-top: 60px;
+    }
+
+    .card {
+        min-height: auto;
+        padding: 48px 28px;
+    }
+}
