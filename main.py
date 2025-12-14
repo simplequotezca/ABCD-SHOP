@@ -242,7 +242,7 @@ def compute_estimate(pricing: Dict[str, Any], ai: Dict[str, Any]) -> Dict[str, A
 
     r = float(pricing.get("range_pct", 0.15))
     low = max(0.0, total * (1 - r))
-    high = total * (1 + r))
+    high = total * (1 + r)
 
     return {
         "body_hours": round(body_hours, 1),
