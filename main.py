@@ -611,21 +611,37 @@ def result_page(shop_slug: str, token: str):
       <ul class="list">{ops_html}</ul>
     </div>
 
-    <div class="block">
-      <div class="label">Estimate (CAD)</div>
-      <div class="text big">{html_escape(est["total_range"])}</div>
-      <div class="mini">
-        Body: {est["body_hours"]}h ({html_escape(est["labor_body"])}) ·
-        Paint: {est["paint_hours"]}h ({html_escape(est["labor_paint"])})<br/>
-        Materials: {html_escape(est["materials"])} · Parts (rough): {html_escape(est["parts_cost"])}<br/>
-        {html_escape(price_framing)}
-      </div>
-    </div>
+    <div class="block estimate-block">
+  <div class="label">Initial Visible Damage Estimate (CAD)</div>
 
-    <div class="block">
-      <div class="label">Photos</div>
-      <div class="photos">{photo_links}</div>
-    </div>
+  <div class="text big">
+    {html_escape(est["total_range"])}
+  </div>
+
+  <div class="mini">
+    Based on visible damage in the photos provided.
+    This estimate does <strong>not</strong> include internal, structural,
+    suspension, or electronic damage that may be discovered after teardown.
+  </div>
+
+  <div class="mini breakdown">
+    Body labor: {est["body_hours"]}h ({html_escape(est["body_cost"])})<br/>
+    Paint labor: {est["paint_hours"]}h ({html_escape(est["paint_cost"])})<br/>
+    Materials: {html_escape(est["materials"])}<br/>
+    Parts (rough): {html_escape(est["parts_estimate"])}<br/>
+    {html_escape(price_framing)}
+  </div>
+
+  <div class="warning">
+    <strong>Possible final repair cost:</strong> May increase significantly after teardown.
+    Front-corner impacts often involve hidden damage beneath exterior panels.
+  </div>
+
+  <div class="subtle">
+    This assessment provides early guidance only. Final repair cost and
+    repairability are confirmed after teardown and in-person inspection.
+  </div>
+</div>
 
     <a class="cta" href="/quote/{html_escape(shop_slug)}">Back to start</a>
 
