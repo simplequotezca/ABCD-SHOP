@@ -1,0 +1,181 @@
+/* =========================
+   RESET & GLOBAL
+   ========================= */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  overflow-x: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  background: radial-gradient(
+      1200px 600px at 50% -200px,
+      #1e2a4a 0%,
+      #0b1020 55%,
+      #070a14 100%
+  );
+  color: #e8ebf3;
+}
+
+/* =========================
+   LAYOUT SHELL
+   ========================= */
+
+.shell {
+  min-height: 100vh;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+/* =========================
+   MAIN CARD
+   ========================= */
+
+.card {
+  width: 100%;
+  max-width: 420px;
+  background: linear-gradient(
+    180deg,
+    rgba(255,255,255,0.06),
+    rgba(255,255,255,0.02)
+  );
+  border-radius: 22px;
+  padding: 28px 24px 26px;
+  box-shadow:
+    0 20px 60px rgba(0,0,0,0.45),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+  backdrop-filter: blur(18px);
+}
+
+/* =========================
+   LOGO
+   ========================= */
+
+.logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 28px;
+}
+
+.logo img {
+  height: 42px;
+  opacity: 0.85;
+}
+
+/* =========================
+   HEADINGS & TEXT
+   ========================= */
+
+h1 {
+  font-size: 32px;
+  line-height: 1.15;
+  margin: 0 0 12px;
+  font-weight: 700;
+}
+
+.subtitle {
+  font-size: 16px;
+  opacity: 0.85;
+  margin-bottom: 22px;
+}
+
+/* =========================
+   BUTTON
+   ========================= */
+
+.primary-btn {
+  display: block;
+  width: 100%;
+  border: none;
+  border-radius: 14px;
+  padding: 14px 16px;
+  font-size: 16px;
+  font-weight: 600;
+  color: white;
+  background: linear-gradient(
+    135deg,
+    #6a7dff,
+    #5b8dff
+  );
+  box-shadow:
+    0 8px 30px rgba(90,120,255,0.35);
+  cursor: pointer;
+}
+
+.primary-btn:active {
+  transform: translateY(1px);
+}
+
+/* =========================
+   INFO BOX
+   ========================= */
+
+.info-box {
+  margin-top: 22px;
+  padding: 18px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.04);
+}
+
+.info-box ul {
+  padding-left: 18px;
+  margin: 10px 0;
+}
+
+.info-box li {
+  margin: 6px 0;
+}
+
+/* =========================
+   FOOTNOTE
+   ========================= */
+
+.footnote {
+  margin-top: 18px;
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+/* =========================
+   DESKTOP UPGRADE
+   ========================= */
+
+@media (min-width: 900px) {
+  .card {
+    max-width: 560px;
+    padding: 36px 36px 34px;
+  }
+
+  h1 {
+    font-size: 38px;
+  }
+
+  .subtitle {
+    font-size: 17px;
+  }
+}
+
+/* =========================
+   HARD OVERFLOW KILL
+   ========================= */
+
+body::before,
+body::after,
+.shell::before,
+.shell::after {
+  content: none !important;
+}
+
+html {
+  overflow-x: clip;
+}
