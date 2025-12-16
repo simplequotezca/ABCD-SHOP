@@ -239,30 +239,84 @@ def estimate_result(id: str):
 # ============================================================
 @app.post("/api/estimate")
 async def estimate_api(photo: UploadFile = File(...)):
-    # Read photo (even if we don't analyze yet)
+    # Read photo (not analyzed yet)
     await photo.read()
 
-    # Generate estimate ID
     estimate_id = str(uuid.uuid4())
 
-    # Deterministic but simple logic (NO external helpers)
+    # -----------------------------
+    # Severity model (deterministic)
+    # -----------------------------
+    # For now, we hardcode MODERATE.
+    # Later this will be AI- or rule-driven.
+    severity = "Moderate"
+
+    SEVERITY_RULES = {
+        "Minor": {
+            "confidence": "High",
+            "summary": "Minor cosmetic damage detected. Repair is likely straightforward.",
+            "damaged_areas": ["Bumper"],
+            "operations": ["Repair bumper"],
+            "hours": (2, 4),
+            "risk_note": "Minor hidden damage is possible but unlikely."
+        },
+        "Moderate": {
+            "confidence": "Medium",
+            "summary": "Visible body damage detected. Further inspection recommended.",
+            "damaged_areas": ["Bumper", "Fender", "Headlight"],
+            "operations": [
+                "Replace bumper",
+                "Repair fender",
+                "Replace headlight"
+            ],
+            "hours": (8, 14),
+            "risk_note": "Hidden damage is common in moderate impacts."
+        },
+        "Severe": {
+            "confidence": "High",
+            "summary": "Severe damage detected with possible structural involvement.",
+            "damaged_areas": [
+                "Bumper",
+                "Fender",
+                "Headlight",
+                "Suspension",
+                "Structural components"
+            ],
+            "operations": [
+                "Replace bumper",
+                "Replace fender",
+                "Replace headlight",
+                "Inspect suspension",
+                "Structural alignment"
+            ],
+            "hours": (20, 40),
+            "risk_note": "Final repair cost may increase after teardown."
+        }
+    }
+
+    rule = SEVERITY_RULES[severity]
+
+    # -----------------------------
+    # Cost calculation
+    # -----------------------------
+    LABOR_RATE = 110  # $/hour (shop-agnostic for now)
+
+    hours_min, hours_max = rule["hours"]
+    cost_min = hours_min * LABOR_RATE
+    cost_max = hours_max * LABOR_RATE
+
+    # -----------------------------
+    # Store estimate
+    # -----------------------------
     ESTIMATES[estimate_id] = {
-        "severity": "Moderate",
-        "confidence": "Medium confidence",
-        "summary": "Visible body damage detected. Further inspection recommended.",
-        "damaged_areas": [
-            "Bumper",
-            "Fender",
-            "Headlight"
-        ],
-        "operations": [
-            "Replace bumper",
-            "Repair fender",
-            "Replace headlight"
-        ],
-        "cost_min": 1800,
-        "cost_max": 3200,
-        "risk_note": "Final cost may vary due to hidden damage."
+        "severity": severity,
+        "confidence": rule["confidence"],
+        "summary": rule["summary"],
+        "damaged_areas": rule["damaged_areas"],
+        "operations": rule["operations"],
+        "cost_min": cost_min,
+        "cost_max": cost_max,
+        "risk_note": rule["risk_note"]
     }
 
     return JSONResponse({"estimate_id": estimate_id})
