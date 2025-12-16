@@ -299,9 +299,12 @@ async def estimate_api(photo: UploadFile = File(...)):
     # -----------------------------
     # Cost calculation
     # -----------------------------
-    LABOR_RATE = 110  # $/hour
-    cost_min = hours_min * LABOR_RATE
-    cost_max = hours_max * LABOR_RATE
+  
+   shop = resolve_shop(shop_key)
+labor_rate = shop.get("labor_rate", 100)  # fallback safety
+
+cost_min = hours_min * labor_rate
+cost_max = hours_max * labor_rate
 
     # -----------------------------
     # Store estimate
@@ -314,6 +317,7 @@ async def estimate_api(photo: UploadFile = File(...)):
         "operations": operations,
         "labour_hours_min": hours_min,
         "labour_hours_max": hours_max,
+        "labor_rate": labor_rate,
         "cost_min": cost_min,
         "cost_max": cost_max,
         "risk_note": risk_note
