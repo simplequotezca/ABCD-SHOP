@@ -323,3 +323,5 @@ async def estimate_api(photo: UploadFile = File(...)):
     "cost_max": cost_max,
     "risk_note": rule["risk_note"]
 }
+
+return JSONResponse({"estimate_id": estimate_id})
