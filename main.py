@@ -239,18 +239,28 @@ def estimate_result(id: str):
 # ============================================================
 @app.post("/api/estimate")
 async def estimate_api(photo: UploadFile = File(...)):
-    await asyncio.sleep(1)
+    photo_bytes = await photo.read()
+
+    # Deterministic seed so same photo = same estimate
+    seed = _seed_from_photo(photo_bytes)
+
+    # Core estimation logic
+    severity = decide_severity(seed)
+    confidence = severity_confidence(severity)
+    parts, operations = parts_and_operations(severity)
+    hours_min, hours_max = labour_hours_range(severity, seed)
+    costs = estimate_cost(severity, hours_min, hours_max)
 
     estimate_id = str(uuid.uuid4())
     ESTIMATES[estimate_id] = {
-        "severity": "Severe",
-        "confidence": "High",
-        "summary": "Significant front-left damage with possible structural involvement.",
-        "damaged_areas": ["Bumper", "Fender", "Headlight", "Hood", "Suspension"],
-        "operations": ["Replace bumper", "Replace fender", "Replace headlight", "Repair hood", "Inspect suspension"],
-        "cost_min": 5220,
-        "cost_max": 7820,
-        "risk_note": "Hidden damage is common in front-corner impacts."
+        "severity": severity,
+        "confidence": confidence,
+        "summary": severity_summary(severity),
+        "damaged_areas": parts,
+        "operations": operations,
+        "cost_min": costs["total_min"],
+        "cost_max": costs["total_max"],
+        "risk_note": risk_note(severity),
     }
 
     return JSONResponse({"estimate_id": estimate_id})
