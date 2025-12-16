@@ -218,9 +218,10 @@ def estimate_result(id: str):
     <ul>{bullets(data['damaged_areas'])}</ul>
     <ul>{bullets(data['operations'])}</ul>
 
-    <div class="estimate-hours">
-    Labour: {{ labour_hours_min }} – {{ labour_hours_max }} hours 
-    </div>
+   <div class="estimate-hours">
+    Labour: {{ labour_hours_min }} – {{ labour_hours_max }} hours
+</div>
+
 
    
     <div class="big">${data['cost_min']:,} – ${data['cost_max']:,}</div>
