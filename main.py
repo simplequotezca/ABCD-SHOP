@@ -263,5 +263,6 @@ async def estimate_api(photo: UploadFile = File(...)):
         "risk_note": risk_note(severity),
     }
 
-    return JSONResponse({"id": estimate_id})
+return JSONResponse({"estimate_id": estimate_id})
+
 
