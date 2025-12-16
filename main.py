@@ -309,14 +309,17 @@ async def estimate_api(photo: UploadFile = File(...)):
     # Store estimate
     # -----------------------------
     ESTIMATES[estimate_id] = {
-        "severity": severity,
-        "confidence": rule["confidence"],
-        "summary": rule["summary"],
-        "damaged_areas": rule["damaged_areas"],
-        "operations": rule["operations"],
-        "cost_min": cost_min,
-        "cost_max": cost_max,
-        "risk_note": rule["risk_note"]
-    }
+    "severity": severity,
+    "confidence": rule["confidence"],
+    "summary": rule["summary"],
+    "damaged_areas": rule["damaged_areas"],
+    "operations": rule["operations"],
 
-    return JSONResponse({"estimate_id": estimate_id})
+    # 👇 ADD THESE TWO LINES
+    "labour_hours_min": hours_min,
+    "labour_hours_max": hours_max,
+
+    "cost_min": cost_min,
+    "cost_max": cost_max,
+    "risk_note": rule["risk_note"]
+}
