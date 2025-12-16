@@ -220,3 +220,120 @@ async def estimate_api(photo: UploadFile = File(...)):
     }
 
     return JSONResponse({"estimate_id": estimate_id})
+
+
+# ============================================================
+# LOGIC FOUNDATION — SEVERITY → PARTS → HOURS
+# (SAFE TO APPEND AT BOTTOM OF FILE)
+# ============================================================
+
+import hashlib
+from typing import List, Dict, Tuple
+
+
+def _seed_from_photo(photo_bytes: bytes) -> int:
+    """
+    Deterministic seed so the same photo always yields the same result.
+    """
+    return int(hashlib.sha256(photo_bytes).hexdigest()[:8], 16)
+
+
+def decide_severity(seed: int) -> str:
+    """
+    Severity decision (rule-based, deterministic).
+    """
+    if seed % 10 < 2:
+        return "Minor"
+    elif seed % 10 < 6:
+        return "Moderate"
+    return "Severe"
+
+
+def severity_confidence(severity: str) -> str:
+    return {
+        "Minor": "High",
+        "Moderate": "Medium–High",
+        "Severe": "Medium",
+    }[severity]
+
+
+def parts_and_operations(severity: str) -> Tuple[List[str], List[str]]:
+    if severity == "Minor":
+        return (
+            ["Bumper", "Fender liner"],
+            ["Repair bumper", "Replace clips / liners"],
+        )
+
+    if severity == "Moderate":
+        return (
+            ["Bumper", "Fender", "Headlight"],
+            [
+                "Replace bumper",
+                "Replace fender",
+                "Replace headlight",
+            ],
+        )
+
+    # Severe
+    return (
+        ["Bumper", "Fender", "Headlight", "Hood", "Suspension"],
+        [
+            "Replace bumper",
+            "Replace fender",
+            "Replace headlight",
+            "Repair hood",
+            "Inspect suspension",
+        ],
+    )
+
+
+def labour_hours_range(severity: str, seed: int) -> Tuple[int, int]:
+    if severity == "Minor":
+        return 6 + seed % 3, 12 + seed % 3
+
+    if severity == "Moderate":
+        return 14 + seed % 4, 24 + seed % 4
+
+    return 26 + seed % 6, 40 + seed % 6
+
+
+def estimate_cost(
+    severity: str,
+    hours_min: int,
+    hours_max: int,
+    labour_rate: int = 110,
+) -> Dict[str, int]:
+    labour_min = hours_min * labour_rate
+    labour_max = hours_max * labour_rate
+
+    if severity == "Minor":
+        parts_min, parts_max = 400, 900
+    elif severity == "Moderate":
+        parts_min, parts_max = 1400, 3000
+    else:
+        parts_min, parts_max = 2400, 5200
+
+    return {
+        "labour_min": labour_min,
+        "labour_max": labour_max,
+        "parts_min": parts_min,
+        "parts_max": parts_max,
+        "total_min": labour_min + parts_min,
+        "total_max": labour_max + parts_max,
+    }
+
+
+def severity_summary(severity: str) -> str:
+    return {
+        "Minor": "Light cosmetic damage likely limited to exterior bolt-on components.",
+        "Moderate": "Moderate front-corner damage affecting exterior panels and lighting.",
+        "Severe": "Significant front-corner damage with possible structural or mechanical involvement.",
+    }[severity]
+
+
+def risk_note(severity: str) -> str:
+    return {
+        "Minor": "Minor hidden fastener or bracket damage may affect final pricing.",
+        "Moderate": "Hidden damage is common behind bumpers and headlights.",
+        "Severe": "Hidden damage is common in high-impact corner collisions.",
+    }[severity]
