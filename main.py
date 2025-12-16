@@ -192,34 +192,40 @@ def estimate_result(id: str):
     return f"""(UNCHANGED HTML FROM YOUR BASELINE)"""
 
 # ============================================================
-# API — ONLY PLACE WE CHANGED BEHAVIOR
+# ESTIMATE API — LOGIC-ONLY REPLACEMENT
 # ============================================================
+
 @app.post("/api/estimate")
 async def estimate_api(photo: UploadFile = File(...)):
-    await asyncio.sleep(1)
-
     photo_bytes = await photo.read()
-    seed = seed_from_photo(photo_bytes)
 
+    # Deterministic seed so same photo = same estimate
+    seed = _seed_from_photo(photo_bytes)
+
+    # Core logic
     severity = decide_severity(seed)
-    confidence = confidence_for(severity)
-    parts, ops = parts_and_ops(severity)
-    h_min, h_max = labour_hours(severity, seed)
-    costs = cost_from_hours(h_min, h_max, severity)
+    confidence = severity_confidence(severity)
+    parts, operations = parts_and_operations(severity)
+    hours_min, hours_max = labour_hours_range(severity, seed)
+    costs = estimate_cost(severity, hours_min, hours_max)
 
+    # Store result exactly how your UI already expects it
     estimate_id = str(uuid.uuid4())
     ESTIMATES[estimate_id] = {
         "severity": severity,
         "confidence": confidence,
-        "summary": summary_for(severity),
+        "summary": severity_summary(severity),
         "damaged_areas": parts,
-        "operations": ops,
-        "cost_min": costs["cost_min"],
-        "cost_max": costs["cost_max"],
-        "risk_note": risk_note_for(severity),
+        "operations": operations,
+        "labour_hours": f"{hours_min}–{hours_max}",
+        "labour_cost": f"${costs['labour_min']:,} – ${costs['labour_max']:,}",
+        "parts_cost": f"${costs['parts_min']:,} – ${costs['parts_max']:,}",
+        "cost_min": costs["total_min"],
+        "cost_max": costs["total_max"],
+        "risk_note": risk_note(severity),
     }
 
-    return JSONResponse({"estimate_id": estimate_id})
+    return {"estimate_id": estimate_id}
 
 
 # ============================================================
