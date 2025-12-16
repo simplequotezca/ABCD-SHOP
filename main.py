@@ -249,6 +249,21 @@ async def estimate_api(photo: UploadFile = File(...)):
     await photo.read()
 
     estimate_id = str(uuid.uuid4())
+    SHOPS = {
+    "miss": {
+        "name": "Mississauga Collision Center",
+        "labor_rate": 110
+    },
+    "mississauga-collision-center": {
+        "name": "Mississauga Collision Center",
+        "labor_rate": 110
+    },
+    "mississauga-collision-centre": {
+        "name": "Mississauga Collision Centre",
+        "labor_rate": 110
+    }
+}
+
 
     # -----------------------------
     # Severity → Parts → Hours rules
@@ -299,12 +314,11 @@ async def estimate_api(photo: UploadFile = File(...)):
     # -----------------------------
     # Cost calculation
     # -----------------------------
-  
-   shop = resolve_shop(shop_key)
-labor_rate = shop.get("labor_rate", 100)  # fallback safety
+    labor_rate = 110  # default fallback
 
-cost_min = hours_min * labor_rate
-cost_max = hours_max * labor_rate
+    cost_min = hours_min * labor_rate
+    cost_max = hours_max * labor_rate
+
 
     # -----------------------------
     # Store estimate
