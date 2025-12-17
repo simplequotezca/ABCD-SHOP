@@ -196,3 +196,7 @@ def estimate_result(id: str):
     for k, v in d.items():
         html = html.replace(f"{{{{{k}}}}}", str(v))
     return HTMLResponse(html)
+
+@app.get("/", include_in_schema=False)
+def home():
+    return RedirectResponse(url="/quote?shop_id=miss")
