@@ -200,3 +200,4 @@ def estimate_result(id: str):
 @app.get("/", include_in_schema=False)
 def home():
     return RedirectResponse(url="/quote?shop_id=miss")
+
