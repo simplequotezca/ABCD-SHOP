@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 # 🔹 CALENDAR IMPORT (ONLY NEW IMPORT)
-from calendar import create_calendar_event
+from calendar_service import create_calendar_event
 
 app = FastAPI()
 
