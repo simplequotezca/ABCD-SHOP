@@ -48,7 +48,8 @@ html, body {
 .logo {
   display: block;
   margin: 0 auto 18px;
-  height: 28px;
+  width: 96px;   /* adjust this number only if needed */
+  height: auto;  /* critical: prevents distortion */
   opacity: 0.9;
 }
 
