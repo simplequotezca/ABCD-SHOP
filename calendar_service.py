@@ -117,36 +117,25 @@ def create_calendar_event(
     # --------------------------------------------------------
 
     event = {
-        "summary": summary,
-        "description": "\n".join(description_lines),
-        "start": {
-            "dateTime": start_iso,
-            "timeZone": "America/Toronto",
-        },
-        "end": {
-            "dateTime": end_iso,
-            "timeZone": "America/Toronto",
-        },
-        "attendees": (
-            [{"email": shop_email}] if shop_email else []
-        ),
-        "reminders": {
-            "useDefault": False,
-            "overrides": [
-                {"method": "email", "minutes": 0},
-                {"method": "popup", "minutes": 0},
-                {"method": "popup", "minutes": 15},
-            ],
-        },
-    }
+    "summary": summary,
+    "description": "\n".join(description_lines),
+    "start": {
+        "dateTime": start_iso,
+        "timeZone": "America/Toronto",
+    },
+    "end": {
+        "dateTime": end_iso,
+        "timeZone": "America/Toronto",
+    },
+}
 
-    created = (
-        service.events()
-        .insert(
-            calendarId=calendar_id,
-            body=event,
-        )
-        .execute()
+created = (
+    service.events()
+    .insert(
+        calendarId=calendar_id,
+        body=event,
     )
+    .execute()
+)
 
     return created
