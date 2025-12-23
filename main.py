@@ -714,8 +714,6 @@ except Exception as e:
     raise
 
 
-        )
-
     link = r.get("htmlLink") if isinstance(r, dict) else None
     link_html = f'<div style="margin-top:10px;"><a class="backlink" href="{link}" target="_blank" rel="noopener">Open in Google Calendar</a></div>' if link else ""
 
