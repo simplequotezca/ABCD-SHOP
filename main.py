@@ -124,21 +124,27 @@ def send_booking_email(
         </div>
         """
 
-        message = Mail(
-            from_email=os.getenv(
-                "FROM_EMAIL",
-                "AI Estimator – SimpleQuotez <simplequotez@yahoo.com>",
-            ),
-            to_emails=to_email,
-            subject=subject,
-            html_content=html,
-        )
+try:
+    reply_to_email = (
+        shop.get("notification_email")
+        if shop and shop.get("notification_email")
+        else os.getenv("DEMO_REPLY_EMAIL")
+    )
 
-        sg.send(message)
+    message = Mail(
+        from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
+        to_emails=to_email,
+        subject="New Booking Request",
+        html_content=html,
+    )
 
-    except Exception as e:
-        print("SENDGRID ERROR:", repr(e))
+    if reply_to_email:
+        message.reply_to = Email(reply_to_email)
 
+    sg.send(message)
+
+except Exception as e:
+    print("SENDGRID ERROR:", repr(e))
 # ============================================================
 # AI VISION JSON CONTRACT
 # ============================================================
