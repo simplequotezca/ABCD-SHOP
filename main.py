@@ -770,8 +770,8 @@ def book_appointment(
             ai_summary=ai_summary,
         )
     except Exception as e:
-        print("CALENDAR ERROR:", repr(e))
-        raise
+    print("CALENDAR ERROR:", repr(e))
+    r = {}  # allow booking to continue even if calendar fails
 
     # ✅ SEND BOOKING EMAIL (NON-BLOCKING)
     send_booking_email(
