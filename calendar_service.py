@@ -145,7 +145,6 @@ def create_calendar_event(
         .insert(
             calendarId=calendar_id,
             body=event,
-            sendUpdates="all",  # THIS triggers emails
         )
         .execute()
     )
