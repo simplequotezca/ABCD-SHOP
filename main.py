@@ -717,22 +717,19 @@ def book_appointment(
     name: str = Form(...),
     phone: str = Form(...),
     email: str = Form(...),
-    date: str = Form(...),  # YYYY-MM-DD
-    time: str = Form(...),  # HH:MM (24h)
+    date: str = Form(...),
+    time: str = Form(...),
 ):
-    # Lookup estimate
     est = ESTIMATES.get(estimate_id)
     if not est:
-        return HTMLResponse("<h3>Estimate not found. Please start over.</h3>", status_code=404)
+        return HTMLResponse("<h3>Estimate not found.</h3>", status_code=404)
 
-    # Shop resolution
-    k, cfg = resolve_shop(shop_key or est.get("shop_key", "miss"))
+    k, cfg = resolve_shop(shop_key)
 
-    # Build datetime (naive) — calendar_service applies shop timezone
     try:
         start_dt = datetime.fromisoformat(f"{date}T{time}")
     except Exception:
-        return HTMLResponse("<h3>Invalid date/time. Please go back and try again.</h3>", status_code=400)
+        return HTMLResponse("<h3>Invalid date/time.</h3>", status_code=400)
 
     end_dt = start_dt + timedelta(hours=1)
 
@@ -741,7 +738,6 @@ def book_appointment(
         "confidence": est.get("confidence"),
         "labor_hours_range": f"{est.get('labour_hours_min')}–{est.get('labour_hours_max')} hrs",
         "price_range": f"{est.get('cost_min')} – {est.get('cost_max')}",
-        "damaged_parts": est.get("damaged_areas", []),
     }
 
     try:
@@ -754,66 +750,28 @@ def book_appointment(
             photo_urls=est.get("photo_urls", []),
             ai_summary=ai_summary,
         )
-
-    except Exception as e:
-    print("CALENDAR ERROR:", repr(e))
-    raise
-
-# ===========================
-# SEND BOOKING EMAIL (SENDGRID)
-# ===========================
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-
-try:
-        r = create_calendar_event(
-            shop_key=k,
-            start_iso=start_dt.isoformat(),
-            end_iso=end_dt.isoformat(),
-            summary=f"New Booking – {cfg.get('name','Shop')}",
-            customer={"name": name, "phone": phone, "email": email},
-            photo_urls=est.get("photo_urls", []),
-            ai_summary=ai_summary,
-        )
-
     except Exception as e:
         print("CALENDAR ERROR:", repr(e))
         raise
 
-send_booking_email(
-    shop_name=cfg.get("name", "Collision Shop"),
-    shop_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
-    customer_name=name,
-    phone=phone,
-    email=email,
-    date=date,
-    time=time,
-    ai_summary=ai_summary,
-)
+    link = r.get("htmlLink") if isinstance(r, dict) else ""
 
     return HTMLResponse(
-        f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-  <title>Booking confirmed</title>
-  <link rel="stylesheet" href="/static/style.css" />
-</head>
-<body class="page">
-  <div class="card">
-    <div class="title">Booking request sent</div>
-    <div class="subtitle" style="margin-top:8px;">{cfg.get('name','Shop')}</div>
-
-    <div style="margin-top:14px; line-height:1.45;">
-      We’ve sent your appointment request to the shop.
-      A confirmation email has been sent.
-    </div>
-
-    {link_html}
-
-    <a class="backlink" href="/quote?shop_id={k}">← Start over</a>
-  </div>
-</body>
-</html>"""
+        f"""
+        <html>
+        <head>
+            <title>Booking Confirmed</title>
+            <link rel="stylesheet" href="/static/style.css" />
+        </head>
+        <body class="page">
+            <div class="card">
+                <div class="title">Booking request sent</div>
+                <div class="subtitle">{cfg.get('name')}</div>
+                <p>The shop has received your booking request.</p>
+                <a href="{link}" target="_blank">View in Google Calendar</a><br/>
+                <a href="/quote?shop_id={k}">← Start over</a>
+            </div>
+        </body>
+        </html>
+        """
     )
