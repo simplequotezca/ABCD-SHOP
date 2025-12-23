@@ -129,16 +129,7 @@ def create_calendar_event(
             "dateTime": end_iso,
             "timeZone": "America/Toronto",
         },
-        "attendees": [
-            {"email": shop_email}
-        ],
-        "reminders": {
-            "useDefault": False,
-            "overrides": [
-                {"method": "email", "minutes": 0},
-                {"method": "popup", "minutes": 0},
-            ],
-        },
+       
     }
 
     created_event = (
@@ -146,7 +137,7 @@ def create_calendar_event(
         .insert(
             calendarId=calendar_id,
             body=event,
-            sendUpdates="all",  # 🔥 forces Google email
+            sendUpdates="none",  
         )
         .execute()
     )
