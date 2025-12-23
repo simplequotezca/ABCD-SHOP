@@ -78,7 +78,7 @@ def money_fmt(n: int) -> str:
 # SENDGRID — BOOKING EMAIL (HELPER)
 # ============================================================
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from sendgrid.helpers.mail import Mail, Email
 
 
 def send_booking_email(
@@ -93,6 +93,8 @@ def send_booking_email(
 ):
     try:
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
+
+        reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
         subject = f"🛠 New Booking Request — {shop_name}"
 
@@ -124,68 +126,20 @@ def send_booking_email(
         </div>
         """
 
-try:
-    reply_to_email = (
-        shop.get("notification_email")
-        if shop and shop.get("notification_email")
-        else os.getenv("DEMO_REPLY_EMAIL")
-    )
+        message = Mail(
+            from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
+            to_emails=to_email,
+            subject=subject,
+            html_content=html,
+        )
 
-    message = Mail(
-        from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
-        to_emails=to_email,
-        subject="New Booking Request",
-        html_content=html,
-    )
+        if reply_to_email:
+            message.reply_to = Email(reply_to_email)
 
-    if reply_to_email:
-        message.reply_to = Email(reply_to_email)
+        sg.send(message)
 
-    sg.send(message)
-
-except Exception as e:
-    print("SENDGRID ERROR:", repr(e))
-# ============================================================
-# AI VISION JSON CONTRACT
-# ============================================================
-AI_VISION_JSON_SCHEMA = {
-    "name": "collision_estimate",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "confidence": {"type": "string", "enum": ["Low", "Medium", "High"]},
-            "severity": {"type": "string", "enum": ["Minor", "Moderate", "Severe"]},
-            "driver_pov": {"type": "boolean"},
-            "impact_side": {"type": "string", "enum": ["Driver", "Passenger", "Front", "Rear", "Unknown"]},
-            "damaged_areas": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 12,
-            },
-            "operations": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 18,
-            },
-            "structural_possible": {"type": "boolean"},
-            "mechanical_possible": {"type": "boolean"},
-            "notes": {"type": "string"},
-        },
-        "required": [
-            "confidence",
-            "severity",
-            "driver_pov",
-            "impact_side",
-            "damaged_areas",
-            "operations",
-            "structural_possible",
-            "mechanical_possible",
-            "notes",
-        ],
-    },
-}
-
+    except Exception as e:
+        print("SENDGRID ERROR:", repr(e))
 
 # ============================================================
 # RULE OVERRIDES (CLAMP AI OPTIMISM)
