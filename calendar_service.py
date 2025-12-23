@@ -103,18 +103,35 @@ def create_calendar_event(
         for url in photo_urls:
             description_lines.append(url)
 
-    event = {
-        "summary": summary,
-        "description": "\n".join(description_lines),
-        "start": {
-            "dateTime": start_iso,
-            "timeZone": "America/Toronto",
-        },
-        "end": {
-            "dateTime": end_iso,
-            "timeZone": "America/Toronto",
-        },
+    shop_email = shop.get("notification_email") or shop.get("email")
+
+event = {
+    "summary": summary,
+    "description": "\n".join(description_lines),
+    "start": {
+        "dateTime": start_iso,
+        "timeZone": "America/Toronto",
+    },
+    "end": {
+        "dateTime": end_iso,
+        "timeZone": "America/Toronto",
+    },
+
+    # Notify the shop
+    "attendees": [
+        { "email": shop_email }
+    ] if shop_email else [],
+
+    # Immediate + backup reminders
+    "reminders": {
+        "useDefault": False,
+        "overrides": [
+            { "method": "email", "minutes": 0 },
+            { "method": "popup", "minutes": 0 },
+            { "method": "popup", "minutes": 15 }
+        ]
     }
+}
 
     created = (
         service.events()
