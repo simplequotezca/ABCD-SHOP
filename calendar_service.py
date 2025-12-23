@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -67,9 +67,8 @@ def create_calendar_event(
     ai_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Creates a Google Calendar event with:
-    - Shop email as attendee
-    - Immediate email + popup notifications
+    Creates a Google Calendar event and forces email notification
+    to the shop via attendee + sendUpdates.
     """
 
     service = _load_service()
@@ -85,8 +84,11 @@ def create_calendar_event(
         or os.getenv("SHOP_NOTIFICATION_EMAIL")
     )
 
+    if not shop_email:
+        raise RuntimeError("No shop notification email found")
+
     # --------------------------------------------------------
-    # Build event description
+    # Event description
     # --------------------------------------------------------
 
     description_lines = [
@@ -113,29 +115,40 @@ def create_calendar_event(
             description_lines.append(url)
 
     # --------------------------------------------------------
-    # Build calendar event
+    # Calendar event payload
     # --------------------------------------------------------
 
     event = {
-    "summary": summary,
-    "description": "\n".join(description_lines),
-    "start": {
-        "dateTime": start_iso,
-        "timeZone": "America/Toronto",
-    },
-    "end": {
-        "dateTime": end_iso,
-        "timeZone": "America/Toronto",
-    },
-}
+        "summary": summary,
+        "description": "\n".join(description_lines),
+        "start": {
+            "dateTime": start_iso,
+            "timeZone": "America/Toronto",
+        },
+        "end": {
+            "dateTime": end_iso,
+            "timeZone": "America/Toronto",
+        },
+        "attendees": [
+            {"email": shop_email}
+        ],
+        "reminders": {
+            "useDefault": False,
+            "overrides": [
+                {"method": "email", "minutes": 0},
+                {"method": "popup", "minutes": 0},
+            ],
+        },
+    }
 
-created = (
-    service.events()
-    .insert(
-        calendarId=calendar_id,
-        body=event,
+    created_event = (
+        service.events()
+        .insert(
+            calendarId=calendar_id,
+            body=event,
+            sendUpdates="all",  # 🔥 forces Google email
+        )
+        .execute()
     )
-    .execute()
-)
 
-    return created
+    return created_event
