@@ -72,7 +72,53 @@ def resolve_shop(shop_key: Optional[str]) -> Tuple[str, Dict[str, Any]]:
 
 def money_fmt(n: int) -> str:
     return f"${n:,}"
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
+def send_booking_email(
+    shop_name,
+    customer_name,
+    phone,
+    email,
+    date,
+    time,
+    ai_summary,
+    to_email,
+):
+    try:
+        sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
+
+        subject = f"🛠 New Booking Request — {shop_name}"
+
+        html = f"""
+        <div style="font-family:Arial;line-height:1.5">
+          <h2>New Booking Request</h2>
+          <p><strong>Customer:</strong> {customer_name}</p>
+          <p><strong>Phone:</strong> {phone}</p>
+          <p><strong>Email:</strong> {email}</p>
+          <p><strong>Date:</strong> {date}</p>
+          <p><strong>Time:</strong> {time}</p>
+          <hr/>
+          <p><strong>Severity:</strong> {ai_summary.get('severity')}</p>
+          <p><strong>Labor:</strong> {ai_summary.get('labor_hours_range')}</p>
+          <p><strong>Price:</strong> {ai_summary.get('price_range')}</p>
+        </div>
+        """
+
+        message = Mail(
+            from_email=os.getenv(
+                "FROM_EMAIL",
+                "AI Estimator – SimpleQuotez <simplequotez@yahoo.com>",
+            ),
+            to_emails=to_email,
+            subject=subject,
+            html_content=html,
+        )
+
+        sg.send(message)
+
+    except Exception as e:
+        print("SENDGRID ERROR:", repr(e))
 
 # ============================================================
 # AI VISION JSON CONTRACT
@@ -734,77 +780,16 @@ try:
         print("CALENDAR ERROR:", repr(e))
         raise
 
-    # ===========================
-    # SEND BOOKING EMAIL (SENDGRID)
-    # ===========================
-    from sendgrid import SendGridAPIClient
-    from sendgrid.helpers.mail import Mail
-
-    try:
-        sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
-
-        shop_email = (
-            cfg.get("notification_email")
-            or os.getenv("SHOP_NOTIFICATION_EMAIL")
-            or "shiran.bookings@gmail.com"
-        )
-
-        subject = f"🛠 New Booking Request — {cfg.get('name','Collision Shop')}"
-
-        email_html = f"""
-        <div style="font-family: Arial, sans-serif; line-height:1.5;">
-          <h2>New Booking Request</h2>
-
-          <p><strong>Shop:</strong> {cfg.get('name','Collision Shop')}</p>
-
-          <hr/>
-
-          <p><strong>Customer Name:</strong> {name}</p>
-          <p><strong>Phone:</strong> {phone}</p>
-          <p><strong>Email:</strong> {email}</p>
-
-          <hr/>
-
-          <p><strong>Requested Date:</strong> {date}</p>
-          <p><strong>Requested Time:</strong> {time}</p>
-
-          <hr/>
-
-          <p><strong>AI Estimate Summary</strong></p>
-          <p>Severity: {ai_summary.get('severity')}</p>
-          <p>Confidence: {ai_summary.get('confidence')}</p>
-          <p>Labor Range: {ai_summary.get('labor_hours_range')}</p>
-          <p>Price Range: {ai_summary.get('price_range')}</p>
-
-          <hr/>
-
-          <p>This booking was generated via <strong>SimpleQuotez AI Estimator</strong>.</p>
-          <p>Please review and confirm with the customer.</p>
-        </div>
-        """
-
-        message = Mail(
-            from_email=os.getenv(
-                "FROM_EMAIL",
-                "AI Estimator – SimpleQuotez <simplequotez@yahoo.com>",
-            ),
-            to_emails=shop_email,
-            subject=subject,
-            html_content=email_html,
-        )
-
-        sg.send(message)
-
-    except Exception as email_error:
-        print("SENDGRID ERROR:", repr(email_error))
-
-    link = r.get("htmlLink") if isinstance(r, dict) else None
-    link_html = (
-        f'<div style="margin-top:10px;">'
-        f'<a class="backlink" href="{link}" target="_blank" rel="noopener">'
-        f'Open in Google Calendar</a></div>'
-        if link else ""
-    )
+send_booking_email(
+    shop_name=cfg.get("name", "Collision Shop"),
+    shop_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
+    customer_name=name,
+    phone=phone,
+    email=email,
+    date=date,
+    time=time,
+    ai_summary=ai_summary,
+)
 
     return HTMLResponse(
         f"""<!doctype html>
