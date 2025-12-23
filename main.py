@@ -72,18 +72,24 @@ def resolve_shop(shop_key: Optional[str]) -> Tuple[str, Dict[str, Any]]:
 
 def money_fmt(n: int) -> str:
     return f"${n:,}"
+
+
+# ============================================================
+# SENDGRID — BOOKING EMAIL (HELPER)
+# ============================================================
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
+
 def send_booking_email(
-    shop_name,
-    customer_name,
-    phone,
-    email,
-    date,
-    time,
-    ai_summary,
-    to_email,
+    shop_name: str,
+    customer_name: str,
+    phone: str,
+    email: str,
+    date: str,
+    time: str,
+    ai_summary: dict,
+    to_email: str,
 ):
     try:
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
@@ -91,17 +97,30 @@ def send_booking_email(
         subject = f"🛠 New Booking Request — {shop_name}"
 
         html = f"""
-        <div style="font-family:Arial;line-height:1.5">
+        <div style="font-family:Arial,sans-serif;line-height:1.5">
           <h2>New Booking Request</h2>
+
+          <p><strong>Shop:</strong> {shop_name}</p>
+          <hr/>
+
           <p><strong>Customer:</strong> {customer_name}</p>
           <p><strong>Phone:</strong> {phone}</p>
           <p><strong>Email:</strong> {email}</p>
+
+          <hr/>
+
           <p><strong>Date:</strong> {date}</p>
           <p><strong>Time:</strong> {time}</p>
+
           <hr/>
+
           <p><strong>Severity:</strong> {ai_summary.get('severity')}</p>
+          <p><strong>Confidence:</strong> {ai_summary.get('confidence')}</p>
           <p><strong>Labor:</strong> {ai_summary.get('labor_hours_range')}</p>
           <p><strong>Price:</strong> {ai_summary.get('price_range')}</p>
+
+          <hr/>
+          <p>Sent via <strong>SimpleQuotez AI Estimator</strong></p>
         </div>
         """
 
