@@ -746,20 +746,6 @@ def book_appointment(
     k, cfg = resolve_shop(shop_key)
 
     try:
-        start_dt = datetime.fromisoformat(f"{date}T{time}")
-    except Exception:
-        return HTMLResponse("<h3>Invalid date/time.</h3>", status_code=400)
-
-    end_dt = start_dt + timedelta(hours=1)
-
-    ai_summary = {
-        "severity": est.get("severity"),
-        "confidence": est.get("confidence"),
-        "labor_hours_range": f"{est.get('labour_hours_min')}–{est.get('labour_hours_max')} hrs",
-        "price_range": f"{est.get('cost_min')} – {est.get('cost_max')}",
-    }
-
-    try:
         r = create_calendar_event(
             shop_key=k,
             start_iso=start_dt.isoformat(),
@@ -772,6 +758,18 @@ def book_appointment(
     except Exception as e:
         print("CALENDAR ERROR:", repr(e))
         raise
+
+    # ✅ SEND BOOKING EMAIL (NON-BLOCKING)
+    send_booking_email(
+        shop_name=cfg.get("name", "Collision Shop"),
+        customer_name=name,
+        phone=phone,
+        email=email,
+        date=date,
+        time=time,
+        ai_summary=ai_summary,
+        to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
+    )
 
     link = r.get("htmlLink") if isinstance(r, dict) else ""
 
