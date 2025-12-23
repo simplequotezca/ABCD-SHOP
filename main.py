@@ -744,6 +744,20 @@ def book_appointment(
         return HTMLResponse("<h3>Estimate not found.</h3>", status_code=404)
 
     k, cfg = resolve_shop(shop_key)
+    # Build datetime from form inputs
+    try:
+        start_dt = datetime.fromisoformat(f"{date}T{time}")
+    except Exception:
+        return HTMLResponse("<h3>Invalid date/time.</h3>", status_code=400)
+
+    end_dt = start_dt + timedelta(hours=1)
+
+    ai_summary = {
+        "severity": est.get("severity"),
+        "confidence": est.get("confidence"),
+        "labor_hours_range": f"{est.get('labour_hours_min')}–{est.get('labour_hours_max')} hrs",
+        "price_range": f"{est.get('cost_min')} – {est.get('cost_max')}",
+    }
 
     try:
         r = create_calendar_event(
