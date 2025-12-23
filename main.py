@@ -698,29 +698,22 @@ def book_appointment(
         "damaged_parts": est.get("damaged_areas", []),
     }
 
-    try:
-        r = create_calendar_event(
-            shop_key=k,
-            start_iso=start_dt.isoformat(),
-            end_iso=end_dt.isoformat(),
-            summary=f"New Booking – {cfg.get('name','Shop')}",
-            customer={"name": name, "phone": phone, "email": email},
-            photo_urls=est.get("photo_urls", []),
-            ai_summary=ai_summary,
-        )
-    except Exception as e:
-        return HTMLResponse(
-            f"""<!doctype html>
-<html><body class="page">
-  <div class="card">
-    <div class="title">Booking failed</div>
-    <div style="margin-top:10px; line-height:1.45;">
-      {str(e)}
-    </div>
-    <a class="backlink" href="/estimate/result?id={estimate_id}">← Back</a>
-  </div>
-</body></html>""",
-            status_code=500,
+try:
+    r = create_calendar_event(
+        shop_key=k,
+        start_iso=start_dt.isoformat(),
+        end_iso=end_dt.isoformat(),
+        summary=f"New Booking – {cfg.get('name','Shop')}",
+        customer={"name": name, "phone": phone, "email": email},
+        photo_urls=est.get("photo_urls", []),
+        ai_summary=ai_summary,
+    )
+
+except Exception as e:
+    print("CALENDAR ERROR:", repr(e))
+    raise
+
+
         )
 
     link = r.get("htmlLink") if isinstance(r, dict) else None
