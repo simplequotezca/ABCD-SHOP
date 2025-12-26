@@ -650,6 +650,29 @@ async def estimate_api(
 
     # Run AI on processed images
     ai = await ai_vision_analyze_bytes(processed_photos)
+    severity = ai.get("severity", "Moderate")
+    confidence = ai.get("confidence", "Medium")
+
+    damaged_areas = ai.get("damaged_areas", [])
+    operations = ai.get("operations", [])
+
+    rules_min, rules_max = rules_labor_range(operations, severity)
+    ai_min_f, ai_max_f = ai_adjusted_labor_range(severity, confidence)
+    hours_min, hours_max = blend_labor_ranges(
+        rules_min, rules_max, ai_min_f, ai_max_f
+    )
+
+    labor_rate = int(cfg.get("labor_rate", SHOP_CONFIGS["miss"]["labor_rate"]))
+    cost_min = hours_min * labor_rate
+    cost_max = hours_max * labor_rate
+
+    risk_note = risk_note_for(severity)
+
+    summary = ai.get("notes", "").strip() or (
+        "Visible damage detected. Further inspection recommended."
+    )
+
+    estimate_id = str(uuid.uuid4())
 
     # Store processed photos (lighter + consistent)
     stored_photos = processed_photos[:3]
