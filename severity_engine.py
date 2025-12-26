@@ -78,7 +78,7 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
     if score >= 5:
         return {
             "severity": "Structural Risk",
-            "confidence": "Low–Medium",
+            "confidence": "Medium",
             "labor_range": (16, 28),
             "reasons": reasons,
         }
