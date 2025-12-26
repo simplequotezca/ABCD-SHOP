@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from severity_engine import infer_visual_flags, calculate_severity
 
 # OpenAI (requirements: openai==1.30.5)
 from openai import OpenAI
