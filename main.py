@@ -219,53 +219,6 @@ OP_HOURS = {
 }
 
 
-def rules_labor_range(operations: List[str], severity: str) -> Tuple[int, int]:
-    mn = 0
-    mx = 0
-    for op in (operations or []):
-        if op in OP_HOURS:
-            a, b = OP_HOURS[op]
-            mn += a
-            mx += b
-    # Safety minimums by severity
-    if severity == "Minor":
-        mn = max(mn, 3)
-        mx = max(mx, 6)
-    elif severity == "Moderate":
-        mn = max(mn, 8)
-        mx = max(mx, 14)
-    else:
-        mn = max(mn, 18)
-        mx = max(mx, 33)
-    return int(mn), int(mx)
-
-
-def ai_adjusted_labor_range(severity: str, confidence: str) -> Tuple[float, float]:
-    """
-    Gentle AI-based adjustment target (not final).
-    """
-    base = {
-        "Minor": (3.0, 6.0),
-        "Moderate": (8.0, 14.0),
-        "Severe": (18.0, 33.0),
-    }.get(severity, (8.0, 14.0))
-
-    # Confidence nudges
-    conf_mult = {"Low": 0.9, "Medium": 1.0, "High": 1.05}.get(confidence, 1.0)
-    return base[0] * conf_mult, base[1] * conf_mult
-
-
-def blend_labor_ranges(rules_mn: int, rules_mx: int, ai_mn: float, ai_mx: float) -> Tuple[int, int]:
-    """
-    Blend AI influence at labor level only.
-    """
-    w = max(0.0, min(0.85, AI_LABOR_INFLUENCE))
-    mn = (1 - w) * rules_mn + w * ai_mn
-    mx = (1 - w) * rules_mx + w * ai_mx
-
-    # Clamp to sane bounds
-    mn = max(1.0, mn)
-    mx = max(mn + 1.0, mx)
 
     # Keep modest spread
     if mx - mn > 22:
@@ -650,9 +603,7 @@ async def estimate_api(
 
     # Run AI on processed images
     ai = await ai_vision_analyze_bytes(processed_photos)
-    severity = ai.get("severity", "Moderate")
-    confidence = ai.get("confidence", "Medium")
-
+    
     damaged_areas = ai.get("damaged_areas", [])
     operations = ai.get("operations", [])
 
