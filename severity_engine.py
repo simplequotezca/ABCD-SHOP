@@ -1,75 +1,99 @@
 # severity_engine.py
+from typing import Dict, Any, Tuple
 
-from typing import Dict, Any
 
-
-def calculate_severity(visual_flags: Dict[str, bool]) -> Dict[str, Any]:
+def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
     """
-    visual_flags example:
-    {
-        "wheel_displacement": True,
-        "asymmetrical_impact": True,
-        "ride_height_anomaly": False,
-        "debris_field_large": True
-    }
+    Convert AI vision output into deterministic escalation flags.
+    Conservative by design: better to under-trigger than over-trigger.
     """
 
-    severity_score = 0
-    triggered_rules = []
+    areas = " ".join(ai.get("damaged_areas", [])).lower()
+    ops = " ".join(ai.get("operations", [])).lower()
+    notes = (ai.get("notes") or "").lower()
 
-    # Rule A — Wheel & Suspension
-    if visual_flags.get("wheel_displacement"):
-        severity_score += 3
-        triggered_rules.append("Wheel displacement detected")
-
-    # Rule B — Asymmetrical Impact
-    if visual_flags.get("asymmetrical_impact"):
-        severity_score += 2
-        triggered_rules.append("Asymmetrical impact detected")
-
-    # Rule C — Ride Height
-    if visual_flags.get("ride_height_anomaly"):
-        severity_score += 2
-        triggered_rules.append("Ride height anomaly detected")
-
-    # Rule D — Debris Field
-    if visual_flags.get("debris_field_large"):
-        severity_score += 1
-        triggered_rules.append("Large debris field detected")
-
-    # Severity Ladder
-    if severity_score >= 5:
-        severity_level = "Structural Risk"
-        labor_hours = (16, 28)
-        confidence = "Low–Medium"
-        mandatory_ops = [
-            "Suspension inspection",
-            "Wheel alignment",
-            "Structural measurement",
-            "Pre-scan diagnostics",
-            "Post-scan diagnostics",
-        ]
-
-    elif severity_score >= 3:
-        severity_level = "Panel + Mechanical Risk"
-        labor_hours = (12, 20)
-        confidence = "Medium"
-        mandatory_ops = [
-            "Wheel alignment",
-            "Pre-scan diagnostics",
-            "Post-scan diagnostics",
-        ]
-
-    else:
-        severity_level = "Cosmetic / Panel"
-        labor_hours = (4, 10)
-        confidence = "High"
-        mandatory_ops = []
+    text = " ".join([areas, ops, notes])
 
     return {
-        "severity_level": severity_level,
-        "labor_hours": labor_hours,
-        "confidence": confidence,
-        "mandatory_operations": mandatory_ops,
-        "triggered_rules": triggered_rules,
+        # Wheel / suspension involvement = automatic escalation
+        "wheel_displacement": any(k in text for k in [
+            "wheel",
+            "suspension",
+            "control arm",
+            "tie rod",
+            "alignment",
+            "bent wheel",
+        ]),
+
+        # One-sided or offset impacts
+        "asymmetrical_impact": any(k in text for k in [
+            "one side",
+            "left side",
+            "right side",
+            "offset impact",
+        ]),
+
+        # Vehicle stance issues
+        "ride_height_anomaly": any(k in text for k in [
+            "lean",
+            "uneven",
+            "lower on one side",
+        ]),
+
+        # Force indicator
+        "debris_field_large": any(k in text for k in [
+            "debris",
+            "scattered",
+            "fragments",
+        ]),
+    }
+
+
+def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Hard severity ladder.
+    Once escalated, severity cannot be downgraded.
+    """
+
+    score = 0
+    reasons = []
+
+    if flags.get("wheel_displacement"):
+        score += 3
+        reasons.append("Wheel / suspension displacement")
+
+    if flags.get("asymmetrical_impact"):
+        score += 2
+        reasons.append("Asymmetrical impact")
+
+    if flags.get("ride_height_anomaly"):
+        score += 2
+        reasons.append("Ride height anomaly")
+
+    if flags.get("debris_field_large"):
+        score += 1
+        reasons.append("Large debris field")
+
+    # === SEVERITY LADDER ===
+    if score >= 5:
+        return {
+            "severity": "Structural Risk",
+            "confidence": "Low–Medium",
+            "labor_range": (16, 28),
+            "reasons": reasons,
+        }
+
+    if score >= 3:
+        return {
+            "severity": "Panel + Mechanical Risk",
+            "confidence": "Medium",
+            "labor_range": (12, 20),
+            "reasons": reasons,
+        }
+
+    return {
+        "severity": "Cosmetic / Panel",
+        "confidence": "High",
+        "labor_range": (4, 10),
+        "reasons": reasons,
     }
