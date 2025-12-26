@@ -280,12 +280,53 @@ def risk_note_for(severity: str) -> str:
     if severity == "Minor":
         return "Final cost may vary after in-person inspection."
     return "Hidden damage is common in moderate impacts. Final cost may vary after inspection."
+# ============================================================
+# IMAGE PREPROCESSING (CRITICAL FOR MOBILE PHOTOS)
+# ============================================================
+MAX_AI_IMAGE_BYTES = int(os.getenv("MAX_AI_IMAGE_BYTES", "1500000"))
+MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1600"))
 
+def preprocess_image_for_ai(raw: bytes) -> bytes:
+    if not raw:
+        return b""
+
+    try:
+        img = Image.open(BytesIO(raw))
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        long_edge = max(w, h)
+
+        if long_edge > MAX_IMAGE_DIM:
+            scale = MAX_IMAGE_DIM / long_edge
+            img = img.resize((int(w * scale), int(h * scale)))
+
+        quality = 85
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        data = out.getvalue()
+
+        while len(data) > MAX_AI_IMAGE_BYTES and quality > 35:
+            quality -= 10
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            data = out.getvalue()
+
+        return data
+
+    except Exception as e:
+        print("IMAGE_PREPROCESS_ERROR:", repr(e))
+        return raw
 
 # ============================================================
 # AI VISION CALL (HARDENED — NO MORE 500s)
 # ============================================================
-async def ai_vision_analyze(files: List[UploadFile]) -> Dict[str, Any]:
+AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "8"))
+AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
+
+async def ai_vision_analyze_bytes(images: List[bytes]) -> Dict[str, Any]:
     fallback = {
         "confidence": "Medium",
         "severity": "Moderate",
@@ -295,88 +336,63 @@ async def ai_vision_analyze(files: List[UploadFile]) -> Dict[str, Any]:
         "operations": ["Replace bumper", "Repair fender", "Replace headlight"],
         "structural_possible": False,
         "mechanical_possible": False,
-        "notes": "AI timeout or connection issue. Rules-based estimate used.",
+        "notes": "Preliminary estimate based on visible damage patterns. Final cost may change after inspection.",
     }
 
     if not client:
-        # Fallback rules-only if no key
-        return apply_rule_overrides({
-            **fallback,
-            "notes": "Fallback (no API key).",
-        })
-
-    image_parts = []
-    for f in files:
-        data = await f.read()
-        if not data:
-            continue
-
-        # Hard cap to avoid transport errors on huge mobile photos
-        if len(data) > 6_000_000:
-            try:
-                await f.seek(0)
-            except Exception:
-                pass
-            continue
-
-        try:
-            await f.seek(0)
-        except Exception:
-            pass
-
-        b64 = base64.b64encode(data).decode("utf-8")
-        image_parts.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{f.content_type or 'image/jpeg'};base64,{b64}"},
-            }
-        )
-
-    # If everything got skipped (too large / empty), do not call AI at all
-    if not image_parts:
-        return apply_rule_overrides({
-            **fallback,
-            "notes": "Images were too large or unreadable. Rules-based estimate used.",
-        })
-
-    prompt = (
-        "You are an expert collision estimator.\n"
-        "Analyze the vehicle damage from the photo(s).\n"
-        "Output strictly valid JSON matching the provided schema.\n"
-        "Use DRIVER'S POV for left/right.\n"
-        "Be conservative: if unsure, choose a higher severity and flag structural/mechanical possible.\n"
-        "Return operations as concise repair actions.\n"
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": "Return ONLY JSON."},
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}] + image_parts,
-                },
-            ],
-            response_format={"type": "json_schema", "json_schema": AI_VISION_JSON_SCHEMA},
-            temperature=0.4,
-        )
-
-        raw = resp.choices[0].message.content or "{}"
-        try:
-            ai = json.loads(raw)
-        except Exception:
-            return apply_rule_overrides({
-                **fallback,
-                "notes": "AI response parsing failed. Rules-based estimate used.",
-            })
-
-        return apply_rule_overrides(ai)
-
-    except Exception:
-        # IMPORTANT: Never raise; never 500; always return a safe estimate
+        print("AI_DISABLED")
         return apply_rule_overrides(fallback)
 
+    image_parts = []
+    for b in images:
+        if not b or len(b) > 6_000_000:
+            continue
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(b).decode()}"},
+        })
+
+    if not image_parts:
+        print("AI_SKIPPED_NO_IMAGES")
+        return apply_rule_overrides(fallback)
+
+    prompt = (
+        "You are an expert collision estimator. "
+        "Analyze vehicle damage from photos. "
+        "Return ONLY valid JSON using the provided schema. "
+        "Use driver's POV. Be conservative."
+    )
+
+    for attempt in range(AI_MAX_RETRIES + 1):
+        try:
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=VISION_MODEL,
+                    messages=[
+                        {"role": "system", "content": "Return ONLY JSON."},
+                        {"role": "user", "content": [{"type": "text", "text": prompt}] + image_parts},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": AI_VISION_JSON_SCHEMA,
+                    },
+                    temperature=0.4,
+                ),
+                timeout=AI_TIMEOUT_SECONDS,
+            )
+
+            ai = json.loads(resp.choices[0].message.content or "{}")
+            print("AI_OK")
+            return apply_rule_overrides(ai)
+
+        except Exception as e:
+            print("AI_ATTEMPT_FAILED:", repr(e))
+            if attempt < AI_MAX_RETRIES:
+                await asyncio.sleep(0.4 * (2 ** attempt) + random.uniform(0, 0.3))
+
+    print("AI_FALLBACK")
+    return apply_rule_overrides(fallback)
 
 # ============================================================
 # UI RENDERING (LOCKED STYLE)
@@ -613,42 +629,30 @@ async def estimate_api(
     # limit 1-3 photos
     photos = (photos or [])[:3]
 
-    ai = await ai_vision_analyze(photos)
+    # ------------------------------------------------------------
+# STEP 3C — READ + PREPROCESS PHOTOS ONCE
+# ------------------------------------------------------------
+raw_photos = []
+for f in (photos or [])[:3]:
+    try:
+        b = await f.read()
+        if b:
+            raw_photos.append(b)
+    except Exception:
+        pass
 
-    severity = ai.get("severity", "Moderate")
-    confidence = ai.get("confidence", "Medium")
+# Preprocess for AI (mobile-safe)
+processed_photos = []
+for b in raw_photos:
+    pb = preprocess_image_for_ai(b)
+    if pb:
+        processed_photos.append(pb)
 
-    damaged_areas = ai.get("damaged_areas", [])
-    operations = ai.get("operations", [])
+# Run AI on processed images
+ai = await ai_vision_analyze_bytes(processed_photos)
 
-    rules_min, rules_max = rules_labor_range(operations, severity)
-    ai_min_f, ai_max_f = ai_adjusted_labor_range(severity, confidence)
-    hours_min, hours_max = blend_labor_ranges(rules_min, rules_max, ai_min_f, ai_max_f)
-
-    labor_rate = int(cfg.get("labor_rate", SHOP_CONFIGS["miss"]["labor_rate"]))
-    cost_min = hours_min * labor_rate
-    cost_max = hours_max * labor_rate
-
-    risk_note = risk_note_for(severity)
-
-    summary = ai.get("notes", "").strip() or "Visible damage detected. Further inspection recommended."
-
-    estimate_id = str(uuid.uuid4())
-
-    # Store uploaded photos (in-memory) so shops can view them from the calendar event.
-    stored_photos: List[bytes] = []
-    for f in (photos or [])[:3]:
-        try:
-            # Ensure we read from the start (ai_vision_analyze already seeks, but keep robust)
-            try:
-                await f.seek(0)
-            except Exception:
-                pass
-            b = await f.read()
-            if b:
-                stored_photos.append(b)
-        except Exception:
-            pass
+# Store processed photos (lighter + consistent)
+stored_photos = processed_photos[:3]
 
     # Build absolute URLs for calendar/event description
     base = str(request.base_url).rstrip("/")
