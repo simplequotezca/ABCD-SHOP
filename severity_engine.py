@@ -1,5 +1,5 @@
 # severity_engine.py
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 
 
 def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
@@ -15,7 +15,7 @@ def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
     text = " ".join([areas, ops, notes])
 
     return {
-        # Wheel / suspension involvement = automatic escalation
+        # Wheel / suspension involvement
         "wheel_displacement": any(k in text for k in [
             "wheel",
             "suspension",
@@ -40,11 +40,21 @@ def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
             "lower on one side",
         ]),
 
-        # Force indicator
+        # Force / energy indicators
         "debris_field_large": any(k in text for k in [
             "debris",
             "scattered",
             "fragments",
+        ]),
+
+        # Structural / frame language
+        "frame_signal": any(k in text for k in [
+            "frame",
+            "unibody",
+            "rail",
+            "apron",
+            "core support",
+            "structural",
         ]),
     }
 
@@ -62,6 +72,10 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         score += 3
         reasons.append("Wheel / suspension displacement")
 
+    if flags.get("frame_signal"):
+        score += 3
+        reasons.append("Structural / frame involvement")
+
     if flags.get("asymmetrical_impact"):
         score += 2
         reasons.append("Asymmetrical impact")
@@ -74,7 +88,21 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         score += 1
         reasons.append("Large debris field")
 
-    # === SEVERITY LADDER ===
+    # --------------------------------------------------------
+    # HARD FLOOR RULE
+    # Asymmetry combined with any other signal is never cosmetic
+    # --------------------------------------------------------
+    if flags.get("asymmetrical_impact") and score >= 3:
+        return {
+            "severity": "Panel + Mechanical Risk",
+            "confidence": "Medium",
+            "labor_range": (12, 20),
+            "reasons": reasons,
+        }
+
+    # -------------------
+    # SEVERITY LADDER
+    # -------------------
     if score >= 5:
         return {
             "severity": "Structural Risk",
