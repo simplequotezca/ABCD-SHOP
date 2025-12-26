@@ -629,30 +629,30 @@ async def estimate_api(
     # limit 1-3 photos
     photos = (photos or [])[:3]
 
-    # ------------------------------------------------------------
-# STEP 3C — READ + PREPROCESS PHOTOS ONCE
 # ------------------------------------------------------------
-raw_photos = []
-for f in (photos or [])[:3]:
-    try:
-        b = await f.read()
-        if b:
-            raw_photos.append(b)
-    except Exception:
-        pass
+    # STEP 3C — READ + PREPROCESS PHOTOS ONCE
+    # ------------------------------------------------------------
+    raw_photos = []
+    for f in (photos or [])[:3]:
+        try:
+            b = await f.read()
+            if b:
+                raw_photos.append(b)
+        except Exception:
+            pass
 
-# Preprocess for AI (mobile-safe)
-processed_photos = []
-for b in raw_photos:
-    pb = preprocess_image_for_ai(b)
-    if pb:
-        processed_photos.append(pb)
+    # Preprocess for AI (mobile-safe)
+    processed_photos = []
+    for b in raw_photos:
+        pb = preprocess_image_for_ai(b)
+        if pb:
+            processed_photos.append(pb)
 
-# Run AI on processed images
-ai = await ai_vision_analyze_bytes(processed_photos)
+    # Run AI on processed images
+    ai = await ai_vision_analyze_bytes(processed_photos)
 
-# Store processed photos (lighter + consistent)
-stored_photos = processed_photos[:3]
+    # Store processed photos (lighter + consistent)
+    stored_photos = processed_photos[:3]
 
     # Build absolute URLs for calendar/event description
     base = str(request.base_url).rstrip("/")
