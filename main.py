@@ -31,8 +31,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 
-# 0.00 = rules-only, 0.30 = recommended, 0.50+ = aggressive
-AI_LABOR_INFLUENCE = float(os.getenv("AI_LABOR_INFLUENCE", "0.30"))
+
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -198,26 +197,6 @@ def apply_rule_overrides(ai: Dict[str, Any]) -> Dict[str, Any]:
         ai["severity"] = "Moderate"
 
     return ai
-
-
-# ============================================================
-# HOURS + COST LOGIC (RULES BASELINE + AI BLEND)
-# ============================================================
-OP_HOURS = {
-    "Replace bumper": (3, 6),
-    "Repair bumper": (2, 4),
-    "Refinish bumper": (2, 3),
-    "Replace fender": (3, 6),
-    "Repair fender": (2, 5),
-    "Replace headlight": (1, 2),
-    "Repair hood": (2, 5),
-    "Replace hood": (4, 7),
-    "Inspect suspension": (1, 3),
-    "Align / suspension check": (1, 2),
-    "Pre-scan (diagnostics)": (0, 1),
-    "Post-scan (diagnostics)": (0, 1),
-    "Measure/inspect for hidden damage": (1, 2),
-}
 
 
 
