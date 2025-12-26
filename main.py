@@ -608,11 +608,15 @@ async def estimate_api(
     damaged_areas = ai.get("damaged_areas", [])
     operations = ai.get("operations", [])
 
-    rules_min, rules_max = rules_labor_range(operations, severity)
-    ai_min_f, ai_max_f = ai_adjusted_labor_range(severity, confidence)
-    hours_min, hours_max = blend_labor_ranges(
-        rules_min, rules_max, ai_min_f, ai_max_f
-    )
+   
+    # === SEVERITY ENGINE (AUTHORITATIVE) ===
+flags = infer_visual_flags(ai)
+severity_data = calculate_severity(flags)
+
+severity = severity_data["severity"]
+confidence = severity_data["confidence"]
+hours_min, hours_max = severity_data["labor_range"]
+  
 
     labor_rate = int(cfg.get("labor_rate", SHOP_CONFIGS["miss"]["labor_rate"]))
     cost_min = hours_min * labor_rate
