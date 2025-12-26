@@ -221,11 +221,7 @@ OP_HOURS = {
 
 
 
-    # Keep modest spread
-    if mx - mn > 22:
-        mx = mn + 22
-
-    return int(round(mn)), int(round(mx))
+    
 
 
 def risk_note_for(severity: str) -> str:
@@ -608,15 +604,13 @@ async def estimate_api(
     damaged_areas = ai.get("damaged_areas", [])
     operations = ai.get("operations", [])
 
-   
     # === SEVERITY ENGINE (AUTHORITATIVE) ===
-flags = infer_visual_flags(ai)
-severity_data = calculate_severity(flags)
+    flags = infer_visual_flags(ai)
+    severity_data = calculate_severity(flags)
 
-severity = severity_data["severity"]
-confidence = severity_data["confidence"]
-hours_min, hours_max = severity_data["labor_range"]
-  
+    severity = severity_data["severity"]
+    confidence = severity_data["confidence"]
+    hours_min, hours_max = severity_data["labor_range"]
 
     labor_rate = int(cfg.get("labor_rate", SHOP_CONFIGS["miss"]["labor_rate"]))
     cost_min = hours_min * labor_rate
