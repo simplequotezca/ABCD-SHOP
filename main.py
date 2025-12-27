@@ -2,16 +2,17 @@ import os
 import uuid
 import json
 import base64
-from PIL import Image
-from io import BytesIO
 import asyncio
 import random
-from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timedelta
+from io import BytesIO
+from typing import Dict, Any, Optional, Tuple, List
 
+from PIL import Image
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+
 from severity_engine import infer_visual_flags, calculate_severity
 
 # OpenAI (requirements: openai==1.30.5)
@@ -31,20 +32,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 
-
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Shop config (add more shops here)
 # NOTE: Keep Miss at 110 so your current $ ranges don't swing wildly.
 SHOP_CONFIGS: Dict[str, Dict[str, Any]] = {
-    "miss": {
-        "name": "Mississauga Collision Center",
-        "labor_rate": 110,  # CAD/hour
-    },
+    "miss": {"name": "Mississauga Collision Center", "labor_rate": 110},  # CAD/hr
 }
 
-# Aliases / slugs that should resolve to canonical keys
 SHOP_ALIASES: Dict[str, str] = {
     "miss": "miss",
     "mississauga-collision-center": "miss",
@@ -61,12 +56,10 @@ ESTIMATES: Dict[str, Dict[str, Any]] = {}
 def resolve_shop(shop_key: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     key_raw = (shop_key or "miss").strip()
     canonical = SHOP_ALIASES.get(key_raw, key_raw)
-
     cfg = SHOP_CONFIGS.get(canonical)
     if cfg:
         return canonical, cfg
 
-    # Fallback: accept unknown shops without breaking the UI
     fallback = {
         "name": key_raw.replace("-", " ").title(),
         "labor_rate": SHOP_CONFIGS["miss"]["labor_rate"],
@@ -94,10 +87,9 @@ def send_booking_email(
     time: str,
     ai_summary: dict,
     to_email: str,
-):
+) -> None:
     try:
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
-
         reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
         subject = f"🛠 New Booking Request — {shop_name}"
@@ -145,75 +137,76 @@ def send_booking_email(
     except Exception as e:
         print("SENDGRID ERROR:", repr(e))
 
+
 # ============================================================
 # RULE OVERRIDES (CLAMP AI OPTIMISM)
 # ============================================================
 def apply_rule_overrides(ai: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Clamp optimism. Force safe operations/flags based on signals.
+    Normalize AI output & enforce conservative defaults.
+    NOTE: This does NOT compute your final displayed severity — the severity_engine does.
     """
     ai = dict(ai or {})
 
-    # Normalize lists
     areas = ai.get("damaged_areas") or []
     ops = ai.get("operations") or []
     areas = [str(x).strip() for x in areas if str(x).strip()]
     ops = [str(x).strip() for x in ops if str(x).strip()]
 
-    # If structural/mechanical possible => do not allow Minor
-    if ai.get("structural_possible") or ai.get("mechanical_possible"):
-        if ai.get("severity") == "Minor":
-            ai["severity"] = "Moderate"
-
-    # If frame/unibody keywords present => Severe
-    frame_kw = ("frame", "unibody", "rail", "apron", "structure", "core support")
-    if any(any(k in a.lower() for k in frame_kw) for a in areas):
-        ai["severity"] = "Severe"
-        ai["structural_possible"] = True
-
-    # Mandatory ops for moderate+ in collision estimates
-    must_ops = [
-        "Pre-scan (diagnostics)",
-        "Post-scan (diagnostics)",
-        "Measure/inspect for hidden damage",
-    ]
-    for mo in must_ops:
-        if mo not in ops:
-            ops.append(mo)
-
     # Cap list sizes
     ai["damaged_areas"] = areas[:12]
     ai["operations"] = ops[:18]
 
-    # Driver POV enforcement note (we require it)
+    # Driver POV enforcement
     ai["driver_pov"] = True
 
     # Confidence normalization
     if ai.get("confidence") not in ("Low", "Medium", "High"):
         ai["confidence"] = "Medium"
 
-    # Severity normalization
-    if ai.get("severity") not in ("Minor", "Moderate", "Severe"):
-        ai["severity"] = "Moderate"
+    # impact_side normalization
+    if not isinstance(ai.get("impact_side"), str) or not ai.get("impact_side"):
+        ai["impact_side"] = "Unknown"
+
+    # notes normalization
+    if not isinstance(ai.get("notes"), str):
+        ai["notes"] = ""
+
+    # Boolean normalization
+    ai["structural_possible"] = bool(ai.get("structural_possible", False))
+    ai["mechanical_possible"] = bool(ai.get("mechanical_possible", False))
+
+    # Mandatory ops (always useful on real estimates)
+    must_ops = [
+        "Pre-scan (diagnostics)",
+        "Post-scan (diagnostics)",
+        "Measure/inspect for hidden damage",
+    ]
+    for mo in must_ops:
+        if mo not in ai["operations"]:
+            ai["operations"].append(mo)
 
     return ai
 
 
-
-    
-
-
+# ============================================================
+# RISK NOTE (MATCHES severity_engine LABELS)
+# ============================================================
 def risk_note_for(severity: str) -> str:
-    if severity == "Severe":
-        return "Hidden damage is common in hard impacts. Final cost may increase after teardown."
-    if severity == "Minor":
-        return "Final cost may vary after in-person inspection."
-    return "Hidden damage is common in moderate impacts. Final cost may vary after inspection."
+    s = (severity or "").lower()
+    if "structural" in s:
+        return "Hidden structural damage is possible. Final cost may increase after teardown."
+    if "mechanical" in s:
+        return "Mechanical / suspension involvement may be present. Final cost may vary after inspection."
+    return "Final cost may vary after in-person inspection."
+
+
 # ============================================================
 # IMAGE PREPROCESSING (CRITICAL FOR MOBILE PHOTOS)
 # ============================================================
 MAX_AI_IMAGE_BYTES = int(os.getenv("MAX_AI_IMAGE_BYTES", "1500000"))
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "1600"))
+
 
 def preprocess_image_for_ai(raw: bytes) -> bytes:
     if not raw:
@@ -221,7 +214,6 @@ def preprocess_image_for_ai(raw: bytes) -> bytes:
 
     try:
         img = Image.open(BytesIO(raw))
-
         if img.mode != "RGB":
             img = img.convert("RGB")
 
@@ -249,18 +241,50 @@ def preprocess_image_for_ai(raw: bytes) -> bytes:
         print("IMAGE_PREPROCESS_ERROR:", repr(e))
         return raw
 
+
+# ============================================================
+# AI VISION SCHEMA
+# ============================================================
+AI_VISION_JSON_SCHEMA: Dict[str, Any] = {
+    "name": "collision_estimate",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "confidence": {"type": "string", "enum": ["Low", "Medium", "High"]},
+            "impact_side": {"type": "string"},
+            "driver_pov": {"type": "boolean"},
+            "damaged_areas": {"type": "array", "items": {"type": "string"}},
+            "operations": {"type": "array", "items": {"type": "string"}},
+            "structural_possible": {"type": "boolean"},
+            "mechanical_possible": {"type": "boolean"},
+            "notes": {"type": "string"},
+        },
+        "required": [
+            "confidence",
+            "impact_side",
+            "driver_pov",
+            "damaged_areas",
+            "operations",
+            "structural_possible",
+            "mechanical_possible",
+            "notes",
+        ],
+    },
+}
+
 # ============================================================
 # AI VISION CALL (HARDENED — NO MORE 500s)
 # ============================================================
-AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "8"))
+AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "12"))
 AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
+
 
 async def ai_vision_analyze_bytes(images: List[bytes]) -> Dict[str, Any]:
     fallback = {
         "confidence": "Medium",
-        "severity": "Moderate",
-        "driver_pov": True,
         "impact_side": "Unknown",
+        "driver_pov": True,
         "damaged_areas": ["Bumper", "Fender", "Headlight"],
         "operations": ["Replace bumper", "Repair fender", "Replace headlight"],
         "structural_possible": False,
@@ -276,20 +300,25 @@ async def ai_vision_analyze_bytes(images: List[bytes]) -> Dict[str, Any]:
     for b in images:
         if not b or len(b) > 6_000_000:
             continue
-        image_parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(b).decode()}"},
-        })
+        image_parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64.b64encode(b).decode()}"
+                },
+            }
+        )
 
     if not image_parts:
         print("AI_SKIPPED_NO_IMAGES")
         return apply_rule_overrides(fallback)
 
     prompt = (
-        "You are an expert collision estimator. "
-        "Analyze vehicle damage from photos. "
-        "Return ONLY valid JSON using the provided schema. "
-        "Use driver's POV. Be conservative."
+        "You are an expert collision estimator.\n"
+        "Analyze vehicle damage from photos.\n"
+        "Return ONLY valid JSON using the provided schema.\n"
+        "Use driver's POV. Be conservative.\n"
+        "If you can infer impact zone (front-left/front-right/rear-left/rear-right), put it in impact_side."
     )
 
     for attempt in range(AI_MAX_RETRIES + 1):
@@ -300,13 +329,13 @@ async def ai_vision_analyze_bytes(images: List[bytes]) -> Dict[str, Any]:
                     model=VISION_MODEL,
                     messages=[
                         {"role": "system", "content": "Return ONLY JSON."},
-                        {"role": "user", "content": [{"type": "text", "text": prompt}] + image_parts},
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": prompt}] + image_parts,
+                        },
                     ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": AI_VISION_JSON_SCHEMA,
-                    },
-                    temperature=0.4,
+                    response_format={"type": "json_schema", "json_schema": AI_VISION_JSON_SCHEMA},
+                    temperature=0.3,
                 ),
                 timeout=AI_TIMEOUT_SECONDS,
             )
@@ -318,10 +347,11 @@ async def ai_vision_analyze_bytes(images: List[bytes]) -> Dict[str, Any]:
         except Exception as e:
             print("AI_ATTEMPT_FAILED:", repr(e))
             if attempt < AI_MAX_RETRIES:
-                await asyncio.sleep(0.4 * (2 ** attempt) + random.uniform(0, 0.3))
+                await asyncio.sleep(0.4 * (2**attempt) + random.uniform(0, 0.3))
 
     print("AI_FALLBACK")
     return apply_rule_overrides(fallback)
+
 
 # ============================================================
 # UI RENDERING (LOCKED STYLE)
@@ -452,6 +482,21 @@ def bullets(items: List[str]) -> str:
 
 def render_result(data: Dict[str, Any]) -> str:
     pill = f"{data['severity']} • {data['confidence']} confidence"
+    reasons_html = ""
+    reasons = data.get("reasons") or []
+    if reasons:
+        reasons_html = f"""
+        <div class="divider" style="margin-top:14px;"></div>
+        <div style="margin-top:12px;">
+          <div class="subtitle" style="margin-bottom:8px;">Why this escalated</div>
+          <ul style="margin-top:0;">{bullets(reasons)}</ul>
+        </div>
+        """
+
+    impact_html = ""
+    if data.get("impact_side"):
+        impact_html = f"<div style='margin-top:10px;'>Impact zone: <strong>{data['impact_side']}</strong></div>"
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -465,6 +510,8 @@ def render_result(data: Dict[str, Any]) -> str:
     <div class="title">AI Estimate</div>
 
     <div class="pill">{pill}</div>
+
+    {impact_html}
 
     <div style="margin-top:14px; line-height:1.45;">
       {data["summary"]}
@@ -483,6 +530,8 @@ def render_result(data: Dict[str, Any]) -> str:
       <strong>Possible final repair cost may be higher</strong><br/>
       {data["risk_note"]}
     </div>
+
+    {reasons_html}
 
     <div class="divider" style="margin-top:16px;"></div>
 
@@ -558,11 +607,9 @@ async def estimate_api(
     # limit 1-3 photos
     photos = (photos or [])[:3]
 
-# ------------------------------------------------------------
-    # STEP 3C — READ + PREPROCESS PHOTOS ONCE
-    # ------------------------------------------------------------
-    raw_photos = []
-    for f in (photos or [])[:3]:
+    # READ + PREPROCESS PHOTOS ONCE
+    raw_photos: List[bytes] = []
+    for f in photos:
         try:
             b = await f.read()
             if b:
@@ -570,8 +617,7 @@ async def estimate_api(
         except Exception:
             pass
 
-    # Preprocess for AI (mobile-safe)
-    processed_photos = []
+    processed_photos: List[bytes] = []
     for b in raw_photos:
         pb = preprocess_image_for_ai(b)
         if pb:
@@ -579,31 +625,34 @@ async def estimate_api(
 
     # Run AI on processed images
     ai = await ai_vision_analyze_bytes(processed_photos)
-   # ============================================================
-# VISUAL CONTEXT ENRICHMENT (SAFE, NON-HALLUCINATORY)
-# Adds structured hints only when supported by AI output text.
-# ============================================================
 
-notes = (ai.get("notes") or "").strip()
-areas_text = " ".join(ai.get("damaged_areas", [])).lower()
-ops_text = " ".join(ai.get("operations", [])).lower()
-combined = f"{areas_text} {ops_text} {notes.lower()}"
+    # ----------------------------
+    # VISUAL CONTEXT ENRICHMENT
+    # Only adds hints when supported by AI text content.
+    # ----------------------------
+    notes = (ai.get("notes") or "").strip()
+    areas_text = " ".join(ai.get("damaged_areas", [])).lower()
+    ops_text = " ".join(ai.get("operations", [])).lower()
+    combined = f"{areas_text} {ops_text} {notes.lower()}".strip()
 
-# Impact side / zone (ONLY if the AI text actually contains it)
-if any(k in combined for k in ["left", "driver side", "lf", "front left", "front-left"]):
-    notes = (notes + " Front-left impact.").strip()
-elif any(k in combined for k in ["right", "passenger side", "rf", "front right", "front-right"]):
-    notes = (notes + " Front-right impact.").strip()
+    # Impact side / zone (ONLY if the AI text actually contains it)
+    if any(k2 in combined for k2 in ["left", "driver side", "lf", "front left", "front-left"]):
+        notes = (notes + " Front-left impact.").strip()
+    elif any(k2 in combined for k2 in ["right", "passenger side", "rf", "front right", "front-right"]):
+        notes = (notes + " Front-right impact.").strip()
 
-# Offset front-corner heuristic (needs both bumper + fender OR headlight)
-if ("bumper" in combined) and (("fender" in combined) or ("headlight" in combined)):
-    notes = (notes + " Offset front-corner collision pattern.").strip()
+    # Offset front-corner heuristic (needs both bumper + (fender OR headlight))
+    if ("bumper" in combined) and (("fender" in combined) or ("headlight" in combined)):
+        notes = (notes + " Offset front-corner collision pattern.").strip()
 
-# Wheel involvement (ONLY if wheel/tire/rim appears)
-if any(k in combined for k in ["wheel", "tire", "rim"]):
-    notes = (notes + " Wheel area involvement suspected.").strip()
+    # Wheel involvement (ONLY if wheel/tire/rim appears)
+    if any(k2 in combined for k2 in ["wheel", "tire", "rim"]):
+        notes = (notes + " Wheel area involvement suspected.").strip()
 
-ai["notes"] = notes
+    ai["notes"] = notes
+
+    damaged_areas = ai.get("damaged_areas", [])
+    operations = ai.get("operations", [])
 
     # === SEVERITY ENGINE (AUTHORITATIVE) ===
     flags = infer_visual_flags(ai)
@@ -612,23 +661,19 @@ ai["notes"] = notes
     severity = severity_data["severity"]
     confidence = severity_data["confidence"]
     hours_min, hours_max = severity_data["labor_range"]
+    reasons = severity_data.get("reasons", [])
 
     labor_rate = int(cfg.get("labor_rate", SHOP_CONFIGS["miss"]["labor_rate"]))
     cost_min = hours_min * labor_rate
     cost_max = hours_max * labor_rate
 
     risk_note = risk_note_for(severity)
-
-    summary = ai.get("notes", "").strip() or (
-        "Visible damage detected. Further inspection recommended."
-    )
+    summary = ai.get("notes", "").strip() or "Visible damage detected. Further inspection recommended."
+    impact_side = ai.get("impact_side", "Unknown")
 
     estimate_id = str(uuid.uuid4())
 
-    # Store processed photos (lighter + consistent)
     stored_photos = processed_photos[:3]
-
-    # Build absolute URLs for calendar/event description
     base = str(request.base_url).rstrip("/")
     photo_urls = [f"{base}/estimate/photo/{estimate_id}/{i}" for i in range(len(stored_photos))]
 
@@ -636,9 +681,11 @@ ai["notes"] = notes
         "shop_key": k,
         "severity": severity,
         "confidence": confidence,
+        "impact_side": impact_side,
         "summary": summary,
         "damaged_areas": damaged_areas,
         "operations": operations,
+        "reasons": reasons,
         "labour_hours_min": hours_min,
         "labour_hours_max": hours_max,
         "cost_min": money_fmt(cost_min),
@@ -686,7 +733,7 @@ def book_appointment(
         return HTMLResponse("<h3>Estimate not found.</h3>", status_code=404)
 
     k, cfg = resolve_shop(shop_key)
-    # Build datetime from form inputs
+
     try:
         start_dt = datetime.fromisoformat(f"{date}T{time}")
     except Exception:
@@ -713,9 +760,8 @@ def book_appointment(
         )
     except Exception as e:
         print("CALENDAR ERROR:", repr(e))
-        r = {}  # allow booking to continue even if calendar fails
-        
-    # ✅ SEND BOOKING EMAIL (NON-BLOCKING)
+        r = {}
+
     send_booking_email(
         shop_name=cfg.get("name", "Collision Shop"),
         customer_name=name,
