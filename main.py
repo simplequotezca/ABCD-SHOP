@@ -579,19 +579,31 @@ async def estimate_api(
 
     # Run AI on processed images
     ai = await ai_vision_analyze_bytes(processed_photos)
-    # --- FORCE VISUAL CONTEXT ENRICHMENT ---
-    if any(a.lower() in ["fender", "headlight", "bumper"] for a in ai.get("damaged_areas", [])):
-    ai["notes"] = (ai.get("notes", "") + " Front-left impact. Offset collision.").strip()
+   # ============================================================
+# VISUAL CONTEXT ENRICHMENT (SAFE, NON-HALLUCINATORY)
+# Adds structured hints only when supported by AI output text.
+# ============================================================
 
-    if "wheel" in " ".join(ai.get("damaged_areas", [])).lower():
-    ai["notes"] += " Wheel involvement suspected."
+notes = (ai.get("notes") or "").strip()
+areas_text = " ".join(ai.get("damaged_areas", [])).lower()
+ops_text = " ".join(ai.get("operations", [])).lower()
+combined = f"{areas_text} {ops_text} {notes.lower()}"
 
-    # Debris heuristic
-    if len(processed_photos) >= 1:
-    ai["notes"] += " Debris field visible."
-    
-    damaged_areas = ai.get("damaged_areas", [])
-    operations = ai.get("operations", [])
+# Impact side / zone (ONLY if the AI text actually contains it)
+if any(k in combined for k in ["left", "driver side", "lf", "front left", "front-left"]):
+    notes = (notes + " Front-left impact.").strip()
+elif any(k in combined for k in ["right", "passenger side", "rf", "front right", "front-right"]):
+    notes = (notes + " Front-right impact.").strip()
+
+# Offset front-corner heuristic (needs both bumper + fender OR headlight)
+if ("bumper" in combined) and (("fender" in combined) or ("headlight" in combined)):
+    notes = (notes + " Offset front-corner collision pattern.").strip()
+
+# Wheel involvement (ONLY if wheel/tire/rim appears)
+if any(k in combined for k in ["wheel", "tire", "rim"]):
+    notes = (notes + " Wheel area involvement suspected.").strip()
+
+ai["notes"] = notes
 
     # === SEVERITY ENGINE (AUTHORITATIVE) ===
     flags = infer_visual_flags(ai)
