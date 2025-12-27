@@ -112,7 +112,7 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         return {
             "severity": "Panel + Mechanical Risk",
             "confidence": "Medium",
-            "labor_range": (12, 20),
+            "labor_range": (14, 26),
             "reasons": reasons,
         }
 
@@ -121,7 +121,7 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         return {
             "severity": "Structural Risk" if flags.get("frame_signal") else "Panel + Mechanical Risk",
             "confidence": "Medium",
-            "labor_range": (16, 28) if flags.get("frame_signal") else (12, 20),
+            "labor_range": (20, 36) if flags.get("frame_signal") else (14, 26),
             "reasons": reasons,
         }
 
@@ -132,7 +132,7 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         return {
             "severity": "Structural Risk",
             "confidence": "Medium",
-            "labor_range": (16, 28),
+            "labor_range": (20, 36),
             "reasons": reasons,
         }
 
@@ -140,13 +140,13 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
         return {
             "severity": "Panel + Mechanical Risk",
             "confidence": "Medium",
-            "labor_range": (12, 20),
+            "labor_range": (14, 26),
             "reasons": reasons,
         }
 
     return {
         "severity": "Cosmetic / Panel",
         "confidence": "High",
-        "labor_range": (4, 10),
+        "labor_range": (6, 14),
         "reasons": reasons,
     }
