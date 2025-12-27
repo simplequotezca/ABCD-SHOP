@@ -5,7 +5,7 @@ from typing import Dict, Any
 def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
     """
     Convert AI vision output into deterministic escalation flags.
-    Conservative by design: better to under-trigger than over-trigger.
+    Rule-based and conservative. No hallucination.
     """
 
     areas = " ".join(ai.get("damaged_areas", [])).lower()
@@ -18,6 +18,8 @@ def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
         # Wheel / suspension involvement
         "wheel_displacement": any(k in text for k in [
             "wheel",
+            "tire",
+            "rim",
             "suspension",
             "control arm",
             "tie rod",
@@ -25,12 +27,18 @@ def infer_visual_flags(ai: Dict[str, Any]) -> Dict[str, bool]:
             "bent wheel",
         ]),
 
+        # Front corner / offset collision pattern
+        "front_corner_impact": (
+            ("bumper" in text) and
+            (("fender" in text) or ("headlight" in text))
+        ),
+
         # One-sided or offset impacts
         "asymmetrical_impact": any(k in text for k in [
             "one side",
             "left side",
             "right side",
-            "offset impact",
+            "offset",
         ]),
 
         # Vehicle stance issues
@@ -68,17 +76,24 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
     score = 0
     reasons = []
 
+    # --------------------
+    # PRIMARY ESCALATORS
+    # --------------------
     if flags.get("wheel_displacement"):
         score += 3
-        reasons.append("Wheel / suspension displacement")
+        reasons.append("Wheel / suspension involvement")
 
     if flags.get("frame_signal"):
-        score += 3
+        score += 4
         reasons.append("Structural / frame involvement")
+
+    if flags.get("front_corner_impact"):
+        score += 2
+        reasons.append("Front corner collision pattern")
 
     if flags.get("asymmetrical_impact"):
         score += 2
-        reasons.append("Asymmetrical impact")
+        reasons.append("Asymmetrical / offset impact")
 
     if flags.get("ride_height_anomaly"):
         score += 2
@@ -86,13 +101,14 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
 
     if flags.get("debris_field_large"):
         score += 1
-        reasons.append("Large debris field")
+        reasons.append("High-energy debris field")
 
     # --------------------------------------------------------
-    # HARD FLOOR RULE
-    # Asymmetry combined with any other signal is never cosmetic
+    # HARD FLOORS (NON-NEGOTIABLE)
     # --------------------------------------------------------
-    if flags.get("asymmetrical_impact") and score >= 3:
+
+    # Any front-corner impact is NEVER cosmetic
+    if flags.get("front_corner_impact"):
         return {
             "severity": "Panel + Mechanical Risk",
             "confidence": "Medium",
@@ -100,8 +116,17 @@ def calculate_severity(flags: Dict[str, bool]) -> Dict[str, Any]:
             "reasons": reasons,
         }
 
+    # Any wheel or frame signal is never cosmetic
+    if flags.get("wheel_displacement") or flags.get("frame_signal"):
+        return {
+            "severity": "Structural Risk" if flags.get("frame_signal") else "Panel + Mechanical Risk",
+            "confidence": "Medium",
+            "labor_range": (16, 28) if flags.get("frame_signal") else (12, 20),
+            "reasons": reasons,
+        }
+
     # -------------------
-    # SEVERITY LADDER
+    # SCORE-BASED LADDER
     # -------------------
     if score >= 5:
         return {
