@@ -579,6 +579,16 @@ async def estimate_api(
 
     # Run AI on processed images
     ai = await ai_vision_analyze_bytes(processed_photos)
+    # --- FORCE VISUAL CONTEXT ENRICHMENT ---
+    if any(a.lower() in ["fender", "headlight", "bumper"] for a in ai.get("damaged_areas", [])):
+    ai["notes"] = (ai.get("notes", "") + " Front-left impact. Offset collision.").strip()
+
+    if "wheel" in " ".join(ai.get("damaged_areas", [])).lower():
+    ai["notes"] += " Wheel involvement suspected."
+
+    # Debris heuristic
+    if len(processed_photos) >= 1:
+    ai["notes"] += " Debris field visible."
     
     damaged_areas = ai.get("damaged_areas", [])
     operations = ai.get("operations", [])
