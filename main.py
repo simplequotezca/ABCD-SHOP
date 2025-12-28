@@ -74,8 +74,7 @@ def money_fmt(n: int) -> str:
 # ============================================================
 # SENDGRID — BOOKING EMAIL (HELPER)
 # ============================================================
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email
+
 
 
 def send_booking_email(
@@ -89,6 +88,8 @@ def send_booking_email(
     to_email: str,
 ) -> None:
     try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail, Email
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
         reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
