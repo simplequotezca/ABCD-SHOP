@@ -481,14 +481,14 @@ def bullets(items: List[str]) -> str:
 
 
 def render_result(data: Dict[str, Any]) -> str:
-    pill = f"{data['severity']} • {data['confidence']} confidence"
+    pill = f"Repair Complexity: {data['severity']}"
     reasons_html = ""
     reasons = data.get("reasons") or []
     if reasons:
         reasons_html = f"""
         <div class="divider" style="margin-top:14px;"></div>
         <div style="margin-top:12px;">
-          <div class="subtitle" style="margin-bottom:8px;">Why this escalated</div>
+          <div class="subtitle" style="margin-bottom:8px;">What we’re seeing</div>
           <ul style="margin-top:0;">{bullets(reasons)}</ul>
         </div>
         """
@@ -521,14 +521,14 @@ def render_result(data: Dict[str, Any]) -> str:
     <ul style="margin-top:10px;">{bullets(data["operations"])}</ul>
 
     <div style="margin-top:10px;">
-      Labour: {data["labour_hours_min"]} – {data["labour_hours_max"]} hours
+      Estimated labour range based on visible damage: {data["labour_hours_min"]} – {data["labour_hours_max"]} hours
     </div>
 
     <div class="big">{data["cost_min"]} – {data["cost_max"]}</div>
 
     <div class="warning">
-      <strong>Possible final repair cost may be higher</strong><br/>
-      {data["risk_note"]}
+      <strong>Preliminary intake range</strong><br/>
+      Final repair scope is confirmed after in-person inspection and teardown.
     </div>
 
     {reasons_html}
