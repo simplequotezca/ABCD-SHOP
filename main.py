@@ -521,17 +521,31 @@ def render_result(data: Dict[str, Any]) -> str:
     <ul style="margin-top:12px;">{bullets(data["damaged_areas"])}</ul>
     <ul style="margin-top:10px;">{bullets(data["operations"])}</ul>
 
-    <div style="margin-top:10px;">
-      Estimated labour range based on visible damage: {data["labour_hours_min"]} – {data["labour_hours_max"]} hours
-    </div>
+    <div class="price-block">
 
-    <div class="big">{data["cost_min"]} – {data["cost_max"]}</div>
+  <div class="price-title">Initial intake assessment</div>
 
-    <div class="warning">
-    <strong>Preliminary intake range</strong><br/>
-    This estimate helps the shop prepare for inspection. Final pricing is confirmed after teardown.
-    </div>
+  <div class="price-label">Estimated labor range</div>
+  <div class="price-range">{data["cost_min"]} – {data["cost_max"]}</div>
 
+  <div class="price-scope">
+    Based on visible damage only.<br/>
+    Parts, structural findings, and supplements are not included.
+  </div>
+
+  <div class="price-divider"></div>
+
+  <div class="price-next-title">What happens next</div>
+  <div class="price-next-text">
+    This preliminary range helps the shop prepare for inspection and teardown.
+    Final repair costs are determined after disassembly and diagnostics.
+  </div>
+
+  <div class="price-safety">
+    Most collision repairs increase after teardown due to hidden damage.
+  </div>
+
+  </div>
     {reasons_html}
 
     <div class="divider" style="margin-top:16px;"></div>
