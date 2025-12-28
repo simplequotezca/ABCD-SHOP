@@ -482,7 +482,7 @@ def bullets(items: List[str]) -> str:
 
 
 def render_result(data: Dict[str, Any]) -> str:
-    pill = f"Preliminary assessment: {data['severity']}"
+    pill = f"Preliminary assessment: {data['severity']} • {data['confidence']} confidence"
     reasons_html = ""
     reasons = data.get("reasons") or []
     if reasons:
