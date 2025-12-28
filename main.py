@@ -481,14 +481,14 @@ def bullets(items: List[str]) -> str:
 
 
 def render_result(data: Dict[str, Any]) -> str:
-    pill = f"Repair Complexity: {data['severity']}"
+    pill = f"Preliminary assessment: {data['severity']}"
     reasons_html = ""
     reasons = data.get("reasons") or []
     if reasons:
         reasons_html = f"""
         <div class="divider" style="margin-top:14px;"></div>
         <div style="margin-top:12px;">
-          <div class="subtitle" style="margin-bottom:8px;">What we’re seeing</div>
+          <div class="subtitle" style="margin-bottom:8px;">Inspection considerations</div>
           <ul style="margin-top:0;">{bullets(reasons)}</ul>
         </div>
         """
@@ -527,8 +527,8 @@ def render_result(data: Dict[str, Any]) -> str:
     <div class="big">{data["cost_min"]} – {data["cost_max"]}</div>
 
     <div class="warning">
-      <strong>Preliminary intake range</strong><br/>
-      Final repair scope is confirmed after in-person inspection and teardown.
+    <strong>Preliminary intake range</strong><br/>
+    This estimate helps the shop prepare for inspection. Final pricing is confirmed after teardown.
     </div>
 
     {reasons_html}
