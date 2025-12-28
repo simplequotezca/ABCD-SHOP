@@ -525,7 +525,7 @@ def render_result(data: Dict[str, Any]) -> str:
 
   <div class="price-title">Initial intake assessment</div>
 
-  <div class="price-label">Estimated labor range</div>
+  <div class="price-label">Estimated labor cost (initial intake)</div>
   <div class="price-range">{data["cost_min"]} – {data["cost_max"]}</div>
 
   <div class="price-scope">
