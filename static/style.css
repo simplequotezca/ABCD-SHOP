@@ -179,23 +179,7 @@ input[type="file"] {
   display: inline-block;
 }
 
-.big {
-  font-size: 32px;
-  font-weight: 800;
-  text-align: center;
-  margin: 18px 0;
-}
 
-.warning {
-  background: rgba(255,196,120,0.08);
-  border: 1px solid rgba(255,196,120,0.25);
-  border-radius: 14px;
-  padding: 14px;
-  font-size: 14px;
-  line-height: 1.45;
-  color: #ffd9a3;
-  margin-top: 16px;
-}
 
 /* ===============================
    LINKS
@@ -214,8 +198,8 @@ input[type="file"] {
    ============================ */
 
 .price-block {
-  margin-top: 28px;
-  padding: 22px 20px;
+  margin-top: 24px;
+  padding: 20px 18px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.06);
