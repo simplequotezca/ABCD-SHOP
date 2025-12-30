@@ -85,6 +85,7 @@ def send_booking_email(
     date: str,
     time: str,
     ai_summary: dict,
+    photo_urls: list,
     to_email: str,
 ) -> None:
     try:
@@ -94,6 +95,13 @@ def send_booking_email(
         reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
         subject = f"🛠 New Booking Request — {shop_name}"
+
+        photos_html = ""
+        if photo_urls:
+        photos_html = "<hr/><p><strong>Uploaded Photos:</strong></p><ul>"
+        for i, url in enumerate(photo_urls, 1):
+        photos_html += f'<li><a href="{url}" target="_blank">Photo {i}</a></li>'
+        photos_html += "</ul>"
 
         html = f"""
         <div style="font-family:Arial,sans-serif;line-height:1.5">
@@ -117,6 +125,8 @@ def send_booking_email(
           <p><strong>Confidence:</strong> {ai_summary.get('confidence')}</p>
           <p><strong>Labor:</strong> {ai_summary.get('labor_hours_range')}</p>
           <p><strong>Price:</strong> {ai_summary.get('price_range')}</p>
+
+          {photos_html}
 
           <hr/>
           <p>Sent via <strong>SimpleQuotez AI Estimator</strong></p>
@@ -785,6 +795,7 @@ def book_appointment(
         date=date,
         time=time,
         ai_summary=ai_summary,
+        photo_urls=est.get("photo_urls", []),
         to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
     )
 
