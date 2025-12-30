@@ -97,12 +97,11 @@ def send_booking_email(
         subject = f"🛠 New Booking Request — {shop_name}"
 
         photos_html = ""
-if photo_urls:
-    photos_html = "<hr/><p><strong>Uploaded Photos:</strong></p><ul>"
-    for i, url in enumerate(photo_urls, 1):
-        photos_html += f'<li><a href="{url}" target="_blank">Photo {i}</a></li>'
-    photos_html += "</ul>"
-
+        if photo_urls:
+            photos_html = "<hr/><p><strong>Uploaded Photos:</strong></p><ul>"
+            for i, url in enumerate(photo_urls, 1):
+                photos_html += f'<li><a href="{url}" target="_blank">Photo {i}</a></li>'
+            photos_html += "</ul>"
         html = f"""
         <div style="font-family:Arial,sans-serif;line-height:1.5">
           <h2>New Booking Request</h2>
