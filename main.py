@@ -525,7 +525,33 @@ def render_result(data: Dict[str, Any]) -> str:
     impact_html = ""
     if data.get("impact_side"):
         impact_html = f"<div style='margin-top:10px;'>Impact zone: <strong>{data['impact_side']}</strong></div>"
+        photo_html = ""
+    photo_urls = data.get("photo_urls", [])
 
+    if photo_urls:
+        imgs = ""
+        for url in photo_urls:
+            imgs += f"""
+              <a href="{url}" target="_blank">
+                <img src="{url}"
+                     style="
+                       width:100%;
+                       border-radius:10px;
+                       margin-top:12px;
+                       border:1px solid rgba(255,255,255,0.08);
+                     " />
+              </a>
+            """
+
+        photo_html = f"""
+        <div class="divider" style="margin-top:18px;"></div>
+        <div style="margin-top:14px;">
+          <div class="subtitle" style="margin-bottom:6px;">
+            Uploaded damage photos
+          </div>
+          {imgs}
+        </div>
+        """
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -541,6 +567,7 @@ def render_result(data: Dict[str, Any]) -> str:
     <div class="pill">{pill}</div>
 
     {impact_html}
+    {photo_html}
 
     <div style="margin-top:14px; line-height:1.45;">
       {data["summary"]}
