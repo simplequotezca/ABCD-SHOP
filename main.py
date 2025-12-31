@@ -103,34 +103,58 @@ def send_booking_email(
                 photos_html += f'<li><a href="{url}" target="_blank">Photo {i}</a></li>'
             photos_html += "</ul>"
         html = f"""
-        <div style="font-family:Arial,sans-serif;line-height:1.5">
-          <h2>New Booking Request</h2>
+<div style="font-family: Arial, sans-serif; background:#0b0f14; color:#ffffff; padding:24px;">
 
-          <p><strong>Shop:</strong> {shop_name}</p>
-          <hr/>
+  <h2 style="margin:0 0 12px 0;">🛠 New Booking Request</h2>
 
-          <p><strong>Customer:</strong> {customer_name}</p>
-          <p><strong>Phone:</strong> {phone}</p>
-          <p><strong>Email:</strong> {email}</p>
+  <p style="margin:0 0 16px 0; color:#cfd6dd;">
+    A customer submitted an AI estimate and requested an appointment.
+  </p>
 
-          <hr/>
+  <div style="background:#141a22; padding:16px; border-radius:10px; margin-bottom:18px;">
+    <p><strong>Shop:</strong> {shop_name}</p>
+    <p><strong>Customer:</strong> {customer_name}</p>
+    <p><strong>Phone:</strong> {phone}</p>
+    <p><strong>Email:</strong> {email}</p>
+    <p><strong>Date:</strong> {date}</p>
+    <p><strong>Time:</strong> {time}</p>
+  </div>
 
-          <p><strong>Date:</strong> {date}</p>
-          <p><strong>Time:</strong> {time}</p>
+  <div style="background:#141a22; padding:16px; border-radius:10px; margin-bottom:18px;">
+    <p><strong>Severity:</strong> {ai_summary.get('severity')}</p>
+    <p><strong>Confidence:</strong> {ai_summary.get('confidence')}</p>
+    <p><strong>Estimated Labor:</strong> {ai_summary.get('labor_hours_range')}</p>
+    <p><strong>Estimated Range:</strong> {ai_summary.get('price_range')}</p>
+  </div>
 
-          <hr/>
+  <div style="text-align:center; margin:24px 0;">
+    <a href="{photo_urls[0] if photo_urls else '#'}"
+       style="
+         display:inline-block;
+         padding:14px 22px;
+         background:#3fa9f5;
+         color:#000;
+         font-weight:700;
+         border-radius:8px;
+         text-decoration:none;
+       ">
+       View Full Estimate & Photos
+    </a>
+  </div>
 
-          <p><strong>Severity:</strong> {ai_summary.get('severity')}</p>
-          <p><strong>Confidence:</strong> {ai_summary.get('confidence')}</p>
-          <p><strong>Labor:</strong> {ai_summary.get('labor_hours_range')}</p>
-          <p><strong>Price:</strong> {ai_summary.get('price_range')}</p>
+  <p style="font-size:13px; color:#9aa4af; margin-top:24px;">
+    This estimate is preliminary and based on uploaded photos.
+    Final pricing is confirmed after teardown and in-person inspection.
+  </p>
 
-          {photos_html}
+  <hr style="border:none; border-top:1px solid #222; margin:24px 0;" />
 
-          <hr/>
-          <p>Sent via <strong>SimpleQuotez AI Estimator</strong></p>
-        </div>
-        """
+  <p style="font-size:12px; color:#6b7280;">
+    Sent via <strong>SimpleQuotez AI Estimator</strong>
+  </p>
+
+</div>
+"""
 
         message = Mail(
             from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
@@ -700,8 +724,9 @@ async def estimate_api(
     estimate_id = str(uuid.uuid4())
 
     stored_photos = processed_photos[:3]
-    base = str(request.base_url).rstrip("/")
+    base = os.getenv("PUBLIC_BASE_URL", str(request.base_url)).rstrip("/")
     photo_urls = [f"{base}/estimate/photo/{estimate_id}/{i}" for i in range(len(stored_photos))]
+    request_url = f"{base}/estimate/result?id={estimate_id}"
 
     ESTIMATES[estimate_id] = {
         "shop_key": k,
@@ -720,6 +745,7 @@ async def estimate_api(
         "estimate_id": estimate_id,
         "photo_urls": photo_urls,
         "photos": stored_photos,  # bytes
+        "request_url": request_url,
     }
 
     return JSONResponse({"estimate_id": estimate_id})
