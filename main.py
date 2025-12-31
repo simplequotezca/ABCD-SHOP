@@ -594,8 +594,10 @@ def render_result(data: Dict[str, Any]) -> str:
 # ============================================================
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse(url="/quote?shop_id=miss")
-
+    return RedirectResponse(
+        url="/quote/mississauga-collision-center",
+        status_code=302
+    )
 
 @app.get("/api/health")
 def health():
