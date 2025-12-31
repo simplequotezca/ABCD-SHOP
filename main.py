@@ -96,12 +96,7 @@ def send_booking_email(
 
         subject = f"🛠 New Booking Request — {shop_name}"
 
-        photos_html = ""
-        if photo_urls:
-            photos_html = "<hr/><p><strong>Uploaded Photos:</strong></p><ul>"
-            for i, url in enumerate(photo_urls, 1):
-                photos_html += f'<li><a href="{url}" target="_blank">Photo {i}</a></li>'
-            photos_html += "</ul>"
+       
         html = f"""
 <div style="font-family: Arial, sans-serif; background:#0b0f14; color:#ffffff; padding:24px;">
 
@@ -815,16 +810,16 @@ def book_appointment(
         r = {}
 
    send_booking_email(
-    shop_name=cfg.get("name", "Collision Shop"),
-    customer_name=name,
-    phone=phone,
-    email=email,
-    date=date,
-    time=time,
-    ai_summary=ai_summary,
-    request_url=est.get("request_url"),
-    to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
-)
+        shop_name=cfg.get("name", "Collision Shop"),
+        customer_name=name,
+        phone=phone,
+        email=email,
+        date=date,
+        time=time,
+        ai_summary=ai_summary,
+        request_url=est.get("request_url"),
+        to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
+    )
 
     link = r.get("htmlLink") if isinstance(r, dict) else ""
 
