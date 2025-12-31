@@ -809,7 +809,7 @@ def book_appointment(
         print("CALENDAR ERROR:", repr(e))
         r = {}
 
-   send_booking_email(
+    send_booking_email(
        shop_name=cfg.get("name", "Collision Shop"),
        customer_name=name,
        phone=phone,
