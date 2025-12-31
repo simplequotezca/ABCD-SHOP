@@ -85,7 +85,7 @@ def send_booking_email(
     date: str,
     time: str,
     ai_summary: dict,
-    photo_urls: list,
+    request_url: str,
     to_email: str,
 ) -> None:
     try:
@@ -128,7 +128,7 @@ def send_booking_email(
   </div>
 
   <div style="text-align:center; margin:24px 0;">
-    <a href="{photo_urls[0] if photo_urls else '#'}"
+    <a href="{request_url}"
        style="
          display:inline-block;
          padding:14px 22px;
@@ -814,17 +814,17 @@ def book_appointment(
         print("CALENDAR ERROR:", repr(e))
         r = {}
 
-    send_booking_email(
-        shop_name=cfg.get("name", "Collision Shop"),
-        customer_name=name,
-        phone=phone,
-        email=email,
-        date=date,
-        time=time,
-        ai_summary=ai_summary,
-        photo_urls=est.get("photo_urls", []),
-        to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
-    )
+   send_booking_email(
+    shop_name=cfg.get("name", "Collision Shop"),
+    customer_name=name,
+    phone=phone,
+    email=email,
+    date=date,
+    time=time,
+    ai_summary=ai_summary,
+    request_url=est.get("request_url"),
+    to_email=os.getenv("SHOP_NOTIFICATION_EMAIL", "shiran.bookings@gmail.com"),
+)
 
     link = r.get("htmlLink") if isinstance(r, dict) else ""
 
