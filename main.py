@@ -98,28 +98,28 @@ def send_booking_email(
 
         subject = "New booking request"
 
-        plain_text = textwrap.dedent(f"""
-        New booking request
+        plain_text = textwrap.dedent(f"""\
+New booking request
 
-        Shop: {shop_name}
-        Customer: {customer_name}
-        Phone: {phone}
-        Email: {email}
+Shop: {shop_name}
+Customer: {customer_name}
+Phone: {phone}
+Email: {email}
 
-        Date: {date}
-        Time: {time}
+Date: {date}
+Time: {time}
 
-        Severity: {ai_summary.get("severity")}
-        Confidence: {ai_summary.get("confidence")}
-        Estimated Labor: {ai_summary.get("labor_hours_range")}
-        Estimated Range: {ai_summary.get("price_range")}
+Severity: {ai_summary.get("severity")}
+Confidence: {ai_summary.get("confidence")}
+Estimated Labor: {ai_summary.get("labor_hours_range")}
+Estimated Range: {ai_summary.get("price_range")}
 
-        View full estimate and photos:
-        {request_url or ""}
+View full estimate and photos:
+{request_url or ""}
 
-        This estimate is preliminary and based on uploaded photos.
-        Final pricing is confirmed after teardown and in-person inspection.
-        """).strip()
+This estimate is preliminary and based on uploaded photos.
+Final pricing is confirmed after teardown and in-person inspection.
+""").strip()
 
         html = f"""
 <div style="font-family: Arial, sans-serif; background:#0b0f14; color:#ffffff; padding:24px;">
