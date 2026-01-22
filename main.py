@@ -90,7 +90,6 @@ def send_booking_email(
     to_email: str,
 ) -> None:
     try:
-        import textwrap
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail, Email
 
@@ -116,7 +115,7 @@ def send_booking_email(
         Estimated Range: {ai_summary.get("price_range")}
 
         View full estimate and photos:
-        {request_url}
+        {request_url or ""}
 
         This estimate is preliminary and based on uploaded photos.
         Final pricing is confirmed after teardown and in-person inspection.
@@ -200,36 +199,6 @@ def send_booking_email(
 
     except Exception as e:
         print("SENDGRID ERROR:", repr(e))
-
-</div>
-"""
-
-        message = Mail(
-            from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
-            to_emails=to_email,
-            subject=subject,
-            plain_text_content=plain_text,
-            html_content=html,
-        )
-
-        if reply_to_email:
-            message.reply_to = Email(reply_to_email)
-
-       response = sg.send(message)
-message_id = response.headers.get("X-Message-Id")
-
-print({
-    "event": "booking_email_sent",
-    "shop": shop_name,
-    "to": to_email,
-    "status": response.status_code,
-    "sendgrid_message_id": message_id,
-})
-
-    except Exception as e:
-        print("SENDGRID ERROR:", repr(e))
-
-
 # ============================================================
 # RULE OVERRIDES (CLAMP AI OPTIMISM)
 # ============================================================
