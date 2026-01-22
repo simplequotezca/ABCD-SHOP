@@ -147,7 +147,7 @@ Final pricing is confirmed after teardown and in-person inspection.
   </div>
 
   <div style="text-align:center; margin:24px 0;">
-    <a href="{request_url}"
+    <a href="{request_url or ''}"
        style="
          display:inline-block;
          padding:14px 22px;
