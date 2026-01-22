@@ -94,9 +94,30 @@ def send_booking_email(
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
         reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
-        subject = f"🛠 New Booking Request — {shop_name}"
+        subject = "New Booking Request"
 
-       
+        plain_text = f"""
+        New booking request
+
+        Shop: {shop_name}
+        Customer: {customer_name}
+        Phone: {phone}
+        Email: {email}
+
+        Date: {date}
+        Time: {time}
+
+        Severity: {ai_summary.get("severity")}
+        Confidence: {ai_summary.get("confidence")}
+        Estimated Labor: {ai_summary.get("labor_range")}
+        Estimated Range: {ai_summary.get("price_range")}
+
+        View full estimate and photos:
+        {request_url}
+
+        This estimate is preliminary and based on uploaded photos.
+        Final pricing is confirmed after teardown and in-person inspection.
+        """.strip()
         html = f"""
 <div style="font-family: Arial, sans-serif; background:#0b0f14; color:#ffffff; padding:24px;">
 
@@ -155,6 +176,7 @@ def send_booking_email(
             from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
             to_emails=to_email,
             subject=subject,
+            plain_text_content=plain_text,
             html_content=html,
         )
 
