@@ -4,6 +4,7 @@ import json
 import base64
 import asyncio
 import random
+import textwrap
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, Any, Optional, Tuple, List
@@ -89,14 +90,16 @@ def send_booking_email(
     to_email: str,
 ) -> None:
     try:
+        import textwrap
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail, Email
+
         sg = SendGridAPIClient(os.getenv("SENDGRID_API_KEY"))
         reply_to_email = os.getenv("DEMO_REPLY_EMAIL")
 
-        subject = "New Booking Request"
+        subject = "New booking request"
 
-        plain_text = f"""
+        plain_text = textwrap.dedent(f"""
         New booking request
 
         Shop: {shop_name}
@@ -109,7 +112,7 @@ def send_booking_email(
 
         Severity: {ai_summary.get("severity")}
         Confidence: {ai_summary.get("confidence")}
-        Estimated Labor: {ai_summary.get("labor_range")}
+        Estimated Labor: {ai_summary.get("labor_hours_range")}
         Estimated Range: {ai_summary.get("price_range")}
 
         View full estimate and photos:
@@ -117,11 +120,12 @@ def send_booking_email(
 
         This estimate is preliminary and based on uploaded photos.
         Final pricing is confirmed after teardown and in-person inspection.
-        """.strip()
+        """).strip()
+
         html = f"""
 <div style="font-family: Arial, sans-serif; background:#0b0f14; color:#ffffff; padding:24px;">
 
-  <h2 style="margin:0 0 12px 0;">🛠 New Booking Request</h2>
+  <h2 style="margin:0 0 12px 0;">New Booking Request</h2>
 
   <p style="margin:0 0 16px 0; color:#cfd6dd;">
     A customer submitted an AI estimate and requested an appointment.
@@ -183,7 +187,44 @@ def send_booking_email(
         if reply_to_email:
             message.reply_to = Email(reply_to_email)
 
-        sg.send(message)
+        response = sg.send(message)
+        message_id = response.headers.get("X-Message-Id")
+
+        print({
+            "event": "booking_email_sent",
+            "shop": shop_name,
+            "to": to_email,
+            "status": response.status_code,
+            "sendgrid_message_id": message_id,
+        })
+
+    except Exception as e:
+        print("SENDGRID ERROR:", repr(e))
+
+</div>
+"""
+
+        message = Mail(
+            from_email=Email("bookings@simplequotez.com", "SimpleQuotez"),
+            to_emails=to_email,
+            subject=subject,
+            plain_text_content=plain_text,
+            html_content=html,
+        )
+
+        if reply_to_email:
+            message.reply_to = Email(reply_to_email)
+
+       response = sg.send(message)
+message_id = response.headers.get("X-Message-Id")
+
+print({
+    "event": "booking_email_sent",
+    "shop": shop_name,
+    "to": to_email,
+    "status": response.status_code,
+    "sendgrid_message_id": message_id,
+})
 
     except Exception as e:
         print("SENDGRID ERROR:", repr(e))
